@@ -1,0 +1,31 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <style>
+      body {
+        font: 13px/1.4 -apple-system, system-ui, sans-serif;
+        width: 240px;
+        margin: 0;
+        padding: 14px;
+        color: #1d2226;
+      }
+      h1 { font-size: 14px; margin: 0 0 10px; }
+      .row { display: flex; align-items: center; gap: 8px; margin: 6px 0; }
+      .dot { width: 9px; height: 9px; border-radius: 50%; background: #c2c2c2; }
+      .dot.on { background: #2e7d32; }
+      .dot.off { background: #c62828; }
+      .muted { color: #6b7280; font-size: 12px; }
+      code { background: #f1f3f4; padding: 1px 4px; border-radius: 4px; }
+    </style>
+  </head>
+  <body>
+    <h1>Browser Bridge</h1>
+    <div class="row"><span id="dot" class="dot"></span><span id="status">Checking…</span></div>
+    <div class="muted">CLI socket: <code id="url">ws://127.0.0.1:8787</code></div>
+    <div class="muted" id="tab" style="margin-top:8px"></div>
+    <hr style="border:none;border-top:1px solid #eee;margin:10px 0" />
+    <div class="muted" id="diag" style="white-space:pre-line"></div>
+    <script src="popup.js"></script>
+  </body>
+</html>

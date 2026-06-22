@@ -1,0 +1,97 @@
+# Browser Bridge
+
+A local CLI (`bridge`) that drives your **own logged-in** browser through a
+vanilla MV3 Chrome extension, over a local WebSocket. Point it at any URL and
+get the page back as clean **Markdown**, follow a page's links and fetch each as
+Markdown, or use the built-in **LinkedIn** helpers (people search + profile
+scrape). Designed so an agent reads tidy Markdown instead of parsing raw HTML.
+
+```
+  terminal:  bridge read "https://example.com/article"
+                │
+   WS :8787 ◄───┘
+      │
+  ┌───┴───────────────────────────────────────────────────┐
+  │ Extension                                               │
+  │  offscreen.js  — holds the WebSocket (reconnects)       │
+  │  background.js — drives a tab, extracts content/links   │
+  │  content.js    — LinkedIn-specific scrapers             │
+  └─────────────────────────────────────────────────────────┘
+```
+
+## ⚠️ Read this first — account / site risk
+
+For LinkedIn (and any site with anti-automation), this **violates their Terms of
+Service**. Human-like pacing **reduces velocity-based flags but does not defeat
+detection** — synthetic events are `isTrusted: false` and the OS cursor doesn't
+move. **The only real protection is low volume.** The CLI enforces conservative
+caps for LinkedIn (30 profiles/day, 10 searches/hour) and *refuses* to exceed
+them. Generic `read`/`crawl` aren't capped — pace them yourself. Keep the repo
+private and don't run this on an account you can't afford to lose.
+
+## Setup
+
+```bash
+cd ~/Developer/linkedin-bridge        # (folder name kept; project is "browser-bridge")
+npm install
+npm run build          # builds CLI -> dist-cli, extension -> extension/dist
+npm link               # optional: makes `bridge` available globally
+```
+
+Load the extension:
+
+1. Open `chrome://extensions`, enable **Developer mode**.
+2. **Load unpacked** → select `extension/dist`.
+3. Stay logged into whatever sites you want to read (it uses your real session).
+
+## Usage
+
+```bash
+bridge ping                                  # verify the extension is connected
+
+# Generic — any site → Markdown
+bridge read "https://example.com/article"
+bridge read "https://a.com" "https://b.com" --out pages.md   # bulk
+bridge read --file urls.txt --out pages.json --links
+bridge crawl "https://docs.site.com" --limit 15 --same-host --out docs.json
+
+# LinkedIn helpers
+bridge search "react developer berlin" --pages 2
+bridge profile "https://www.linkedin.com/in/some-slug"
+bridge profiles --file leads.txt --out leads.json
+```
+
+Flags: `--pages N` (search) · `--file PATH` · `--limit N` / `--same-host` (crawl)
+· `--links` (read) · `--json` · `--out FILE` (`.json` → JSON, else Markdown).
+LinkedIn caps via `BRIDGE_MAX_PROFILES_PER_DAY` / `BRIDGE_MAX_SEARCHES_PER_HOUR`.
+
+`bridge probe` / `bridge probe-profile <url>` dump live DOM structure — handy
+when LinkedIn changes markup and selectors in `extension/src/lib/scrape-*.ts`
+need re-tuning.
+
+### How it connects
+
+Each `bridge` command starts a one-shot WebSocket **server** on `127.0.0.1:8787`.
+The extension is the **client** and reconnects automatically, so just keep
+Chrome open — no daemon to run. Generic reads use a dedicated background "bridge
+tab" so they don't disturb your active tab.
+
+## Development
+
+```bash
+npm run watch:ext     # rebuild extension on change (reload it in chrome://extensions)
+npm run typecheck
+```
+
+## Maintenance note
+
+LinkedIn's 2024+ redesign uses fully hashed CSS class names, so scrapers anchor
+on **structure** instead: `[role="list"]` + profile-link cards for search, and
+`section[aria-label="Primary content"]` + leaf-text-line parsing for profiles.
+These will still need occasional updates when LinkedIn shifts markup — use
+`lk probe` / `lk probe-profile <url>` to dump the live DOM and re-tune
+`extension/src/lib/scrape-*.ts`. Brittle fields return `null` rather than
+failing the whole job.
+
+Reused (adapted, Plasmo/zustand stripped) from the `gain-booster` project:
+`dom-helpers`, human pacing, LinkedIn selectors, session scoping.
