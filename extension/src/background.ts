@@ -15,8 +15,20 @@ import type {
   PageContent,
   ProfileData,
   SearchHit,
+  StoredAutomation,
 } from "../../shared/protocol"
 import type { ContentCommand } from "./content"
+import { runRecipeInExtension, type RecipeLike } from "./auto-runner"
+import {
+  clearStoredAutomations,
+  deleteStoredAutomation,
+  getAutoRun,
+  getStoredAutomation,
+  listStoredAutomations,
+  requestAutoCancel,
+  setAutoRun,
+  upsertStoredAutomation,
+} from "./auto-store"
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms))
 
@@ -360,6 +372,60 @@ async function bbExec(payload: any): Promise<any> {
 
   if (payload.op === "snapshot") return snapshot()
 
+  // --- human-like motion helpers (synthetic events; isTrusted is still false) ---
+  const rand = (a: number, b: number) => a + Math.random() * (b - a)
+  const w: any = window
+  const mouse = (w.__bbMouse = w.__bbMouse || { x: innerWidth / 2, y: innerHeight / 2 })
+  const fireMouse = (type: string, x: number, y: number, el?: any) => {
+    const target = el || document.elementFromPoint(x, y) || document.body
+    target.dispatchEvent(
+      new MouseEvent(type, { bubbles: true, cancelable: true, clientX: x, clientY: y, view: window })
+    )
+  }
+  const humanMoveTo = async (x: number, y: number, steps?: number) => {
+    const n = Math.max(2, steps ?? Math.round(rand(6, 14)))
+    const sx = mouse.x
+    const sy = mouse.y
+    for (let i = 1; i <= n; i += 1) {
+      const p = i / n
+      // ease-in-out + small lateral wobble
+      const e = p < 0.5 ? 2 * p * p : 1 - (-2 * p + 2) ** 2 / 2
+      const jx = i < n ? rand(-3, 3) : 0
+      const jy = i < n ? rand(-3, 3) : 0
+      const cx = sx + (x - sx) * e + jx
+      const cy = sy + (y - sy) * e + jy
+      mouse.x = cx
+      mouse.y = cy
+      fireMouse("mousemove", cx, cy)
+      await sleep(rand(8, 28))
+    }
+    mouse.x = x
+    mouse.y = y
+  }
+  const pointFor = (el: any) => {
+    const r = el.getBoundingClientRect()
+    return { x: r.left + r.width * rand(0.3, 0.7), y: r.top + r.height * rand(0.3, 0.7) }
+  }
+  const humanScroll = async (dir: "down" | "up", total?: number) => {
+    const atBottom = () => innerHeight + window.scrollY >= document.body.scrollHeight - 4
+    const atTop = () => window.scrollY <= 2
+    let moved = 0
+    for (let i = 0; i < 100; i += 1) {
+      if (dir === "down" && (atBottom() || (total != null && moved >= total))) break
+      if (dir === "up" && (atTop() || (total != null && moved >= total))) break
+      const stepPx = rand(220, 560)
+      const dy = dir === "down" ? stepPx : -stepPx
+      window.scrollBy({ top: dy })
+      moved += stepPx
+      await sleep(rand(140, 420))
+      // occasional human "re-read" jitter back the other way
+      if (Math.random() < 0.15) {
+        window.scrollBy({ top: dir === "down" ? -rand(40, 120) : rand(40, 120) })
+        await sleep(rand(120, 300))
+      }
+    }
+  }
+
   const step = payload.step
   const a = step.action
   const res: any = { action: a, target: step.target, ok: false }
@@ -373,16 +439,67 @@ async function bbExec(payload: any): Promise<any> {
       }
       return { ...res, error: "timeout waiting for " + step.target }
     }
+    if (a === "waitForUrl") {
+      const start = Date.now()
+      const timeout = step.timeout ?? 15000
+      const needle = step.target ?? ""
+      while (Date.now() - start < timeout) {
+        if (location.href.includes(needle)) return { ...res, ok: true, value: location.href }
+        await sleep(250)
+      }
+      return { ...res, error: "timeout waiting for url ~ " + needle + " (now " + location.href + ")" }
+    }
+    if (a === "scroll") {
+      if (step.human) {
+        if (step.target === "top") await humanScroll("up")
+        else if (step.target === "bottom") await humanScroll("down")
+        else await humanScroll((step.deltaY ?? 0) < 0 ? "up" : "down", Math.abs(step.deltaY ?? innerHeight))
+      } else {
+        if (step.target === "top") window.scrollTo({ top: 0 })
+        else if (step.target === "bottom") window.scrollTo({ top: document.body.scrollHeight })
+        else window.scrollBy({ top: step.deltaY ?? window.innerHeight })
+        await sleep(150)
+      }
+      return { ...res, ok: true, value: String(Math.round(window.scrollY)) }
+    }
+    if (a === "mouseMove") {
+      let x = step.x
+      let y = step.y
+      if ((x == null || y == null) && step.target) {
+        const t = resolve(step.target)
+        if (!t) return { ...res, error: "element not found: " + step.target }
+        if (t.scrollIntoView) t.scrollIntoView({ block: "center" })
+        const p = pointFor(t)
+        x = p.x
+        y = p.y
+      }
+      if (x == null || y == null) return { ...res, error: "mouseMove needs target or x/y" }
+      await humanMoveTo(x, y, step.steps)
+      return { ...res, ok: true, value: `${Math.round(x)},${Math.round(y)}` }
+    }
     const el = resolve(step.target)
     if (!el && a !== "press") return { ...res, error: "element not found: " + step.target }
     if (el && el.scrollIntoView) el.scrollIntoView({ block: "center" })
     switch (a) {
-      case "click":
-        el.focus?.()
-        el.dispatchEvent(new MouseEvent("mousedown", { bubbles: true }))
-        el.dispatchEvent(new MouseEvent("mouseup", { bubbles: true }))
-        el.click()
+      case "click": {
+        if (step.human) {
+          const p = pointFor(el)
+          await humanMoveTo(p.x, p.y, step.steps)
+          await sleep(rand(40, 160))
+          fireMouse("mouseover", p.x, p.y, el)
+          el.focus?.()
+          fireMouse("mousedown", p.x, p.y, el)
+          await sleep(rand(30, 90))
+          fireMouse("mouseup", p.x, p.y, el)
+          el.click()
+        } else {
+          el.focus?.()
+          el.dispatchEvent(new MouseEvent("mousedown", { bubbles: true }))
+          el.dispatchEvent(new MouseEvent("mouseup", { bubbles: true }))
+          el.click()
+        }
         break
+      }
       case "fill":
       case "type":
       case "setValue":
@@ -440,6 +557,68 @@ async function bbExec(payload: any): Promise<any> {
   } catch (e: any) {
     return { ...res, error: String((e && e.message) || e) }
   }
+}
+
+/**
+ * Runs IN the page (MAIN world, via executeScript). Self-contained.
+ * Compiles `code` as the body of an async function (so `await` and `return`
+ * both work), races it against a timeout, and returns a JSON-safe value.
+ * `arg` is exposed to the code as `arg`.
+ *
+ * NOTE: the `new Function` here is the one piece governed by the PAGE's CSP
+ * (script-src 'unsafe-eval'); on the rare strict-CSP page that forbids it the
+ * call throws an EvalError, which we surface cleanly.
+ */
+async function bbEval(payload: { code: string; arg?: unknown; timeout?: number }): Promise<any> {
+  const timeoutMs = payload.timeout ?? 15000
+  const safe = (v: any) => {
+    try {
+      return JSON.parse(JSON.stringify(v === undefined ? null : v))
+    } catch {
+      try {
+        return String(v)
+      } catch {
+        return null
+      }
+    }
+  }
+  try {
+    // eslint-disable-next-line no-new-func
+    const fn = new Function(
+      "arg",
+      '"use strict";\nreturn (async () => {\n' + payload.code + "\n})();"
+    )
+    const timeout = new Promise((_, rej) =>
+      setTimeout(() => rej(new Error("eval timed out after " + timeoutMs + "ms")), timeoutMs)
+    )
+    const value = await Promise.race([Promise.resolve(fn(payload.arg)), timeout])
+    return { ok: true, value: safe(value) }
+  } catch (e: any) {
+    return { ok: false, error: String((e && e.message) || e) }
+  }
+}
+
+async function runEval(
+  code: string,
+  arg: unknown,
+  timeout: number | undefined,
+  target?: string
+): Promise<{ url: string; value: unknown }> {
+  const tabId = await resolveTab(target)
+  const [inj] = await chrome.scripting.executeScript({
+    target: { tabId },
+    world: "MAIN",
+    func: bbEval,
+    args: [{ code, arg, timeout }],
+  })
+  const r = (inj?.result ?? { ok: false, error: "no result" }) as {
+    ok: boolean
+    value?: unknown
+    error?: string
+  }
+  if (!r.ok) throw new Error(r.error ?? "eval failed")
+  const url = (await chrome.tabs.get(tabId)).url ?? ""
+  return { url, value: r.value }
 }
 
 async function resolveTab(target?: string): Promise<number> {
@@ -503,10 +682,11 @@ async function runSnapshot(target?: string) {
   return inj.result as { url: string; title: string; elements: unknown[] }
 }
 
-async function runActions(actions: any[], target?: string, withSnapshot = true) {
+async function runActions(actions: any[], target?: string, withSnapshot = true, continueOnError = false) {
   const tabId = await resolveTab(target)
-  const results: unknown[] = []
+  const results: any[] = []
   for (const step of actions) {
+    let result: any
     if (step.action === "navigate") {
       let host = ""
       try {
@@ -515,11 +695,29 @@ async function runActions(actions: any[], target?: string, withSnapshot = true) 
       await chrome.tabs.update(tabId, { url: step.url })
       await waitForComplete(tabId, host, 30000)
       await sleep(600)
-      results.push({ action: "navigate", target: step.url, ok: true })
-      continue
+      result = { action: "navigate", target: step.url, ok: true }
+    } else if (step.action === "eval") {
+      // Arbitrary JS, MAIN world — same engine as the standalone eval job.
+      const [inj] = await chrome.scripting.executeScript({
+        target: { tabId },
+        world: "MAIN",
+        func: bbEval,
+        args: [{ code: step.code ?? "", arg: step.arg, timeout: step.timeout }],
+      })
+      const r = (inj?.result ?? { ok: false, error: "no result" }) as any
+      result = { action: "eval", target: step.as, ok: !!r.ok, json: r.value, error: r.error }
+    } else {
+      const [inj] = await chrome.scripting.executeScript({
+        target: { tabId },
+        func: bbExec,
+        args: [{ op: "act", step }],
+      })
+      result = inj.result
+      // getText/getValue return a string `value`; also expose it as json for parsing.
+      if (result && result.value != null && result.json == null) result.json = result.value
     }
-    const [inj] = await chrome.scripting.executeScript({ target: { tabId }, func: bbExec, args: [{ op: "act", step }] })
-    results.push(inj.result)
+    results.push(result)
+    if (!continueOnError && result && result.ok === false) break // fail-fast
     await sleep(250) // small pacing between actions
   }
   const out: any = { url: (await chrome.tabs.get(tabId)).url, results }
@@ -589,6 +787,98 @@ async function runProfile(tabId: number, target: string): Promise<ProfileData> {
   return profile
 }
 
+/* --------------------------- capture (non-CDP) -------------------------- */
+
+const CAPTURE_ID = "bb-capture"
+
+/** Runs IN the page (MAIN world) — reads (and optionally clears) the buffer. */
+function bbReadCapture(payload: { kind: string; clear: boolean }): any {
+  const cap = (window as any).__bbCapture
+  if (!cap) return { present: false, items: [] }
+  const items = (payload.kind === "logs" ? cap.logs : cap.network).slice()
+  if (payload.clear) {
+    if (payload.kind === "logs") cap.logs.length = 0
+    else cap.network.length = 0
+  }
+  return { present: true, items }
+}
+
+async function isMonitorActive(): Promise<boolean> {
+  try {
+    const regs = await chrome.scripting.getRegisteredContentScripts({ ids: [CAPTURE_ID] })
+    return regs.length > 0
+  } catch {
+    return false
+  }
+}
+
+/** Arm capture: register the MAIN-world hook for future loads + inject into
+ *  every currently-open http(s) tab so it works without a manual reload. */
+async function runMonitor(op: "start" | "stop" | "status"): Promise<boolean> {
+  if (op === "status") return isMonitorActive()
+  if (op === "stop") {
+    try {
+      await chrome.scripting.unregisterContentScripts({ ids: [CAPTURE_ID] })
+    } catch {
+      /* not registered */
+    }
+    await chrome.storage.local.set({ monitorActive: false })
+    return false
+  }
+  // start — re-register cleanly
+  try {
+    await chrome.scripting.unregisterContentScripts({ ids: [CAPTURE_ID] })
+  } catch {
+    /* fine */
+  }
+  await chrome.scripting.registerContentScripts([
+    {
+      id: CAPTURE_ID,
+      matches: ["http://*/*", "https://*/*"],
+      js: ["capture.js"],
+      runAt: "document_start",
+      world: "MAIN" as chrome.scripting.ExecutionWorld,
+      allFrames: false,
+      persistAcrossSessions: false,
+    },
+  ])
+  // Best-effort: install into already-open tabs (catches future events there).
+  const tabs = await chrome.tabs.query({ url: ["http://*/*", "https://*/*"] })
+  await Promise.all(
+    tabs.map((t) =>
+      t.id != null
+        ? chrome.scripting
+            .executeScript({ target: { tabId: t.id }, world: "MAIN", files: ["capture.js"] })
+            .catch(() => {})
+        : Promise.resolve()
+    )
+  )
+  await chrome.storage.local.set({ monitorActive: true })
+  return true
+}
+
+async function runCapture(
+  kind: "logs" | "network",
+  target?: string,
+  clear = false
+): Promise<{ url: string; items: unknown[] }> {
+  const tabId = await resolveTab(target)
+  const [inj] = await chrome.scripting.executeScript({
+    target: { tabId },
+    world: "MAIN",
+    func: bbReadCapture,
+    args: [{ kind, clear }],
+  })
+  const r = (inj?.result ?? { present: false, items: [] }) as { present: boolean; items: unknown[] }
+  const url = (await chrome.tabs.get(tabId)).url ?? ""
+  if (!r.present) {
+    throw new Error(
+      "No capture buffer on this tab. Run `bridge monitor start`, then reload the page (or navigate) to capture from load."
+    )
+  }
+  return { url, items: r.items }
+}
+
 async function runJob(job: Job): Promise<JobResult> {
   if (job.kind === "ping") return { id: job.id, ok: true, kind: "ping" }
   if (job.kind === "read") {
@@ -608,16 +898,55 @@ async function runJob(job: Job): Promise<JobResult> {
     return { id: job.id, ok: true, kind: "snapshot", url: s.url, title: s.title, elements: s.elements as never }
   }
   if (job.kind === "act") {
-    const r = await runActions(job.actions, job.tab, job.snapshot !== false)
+    const r = await runActions(job.actions, job.tab, job.snapshot !== false, job.continueOnError === true)
     return { id: job.id, ok: true, kind: "act", url: r.url, results: r.results as never, snapshot: r.snapshot }
   }
-  const tabId = await getLinkedInTab()
+  if (job.kind === "eval") {
+    const r = await runEval(job.code, job.arg, job.timeout, job.tab)
+    return { id: job.id, ok: true, kind: "eval", url: r.url, value: r.value }
+  }
+  if (job.kind === "monitor") {
+    const active = await runMonitor(job.op)
+    return { id: job.id, ok: true, kind: "monitor", active }
+  }
+  if (job.kind === "logs") {
+    const r = await runCapture("logs", job.tab, job.clear === true)
+    return { id: job.id, ok: true, kind: "logs", url: r.url, logs: r.items as never }
+  }
+  if (job.kind === "network") {
+    const r = await runCapture("network", job.tab, job.clear === true)
+    return { id: job.id, ok: true, kind: "network", url: r.url, requests: r.items as never }
+  }
+  if (job.kind === "automations") {
+    if (job.op === "upsert") {
+      if (!job.automation) throw new Error("automations upsert requires automation payload")
+      const list = await upsertStoredAutomation(job.automation)
+      return { id: job.id, ok: true, kind: "automations", automations: list }
+    }
+    if (job.op === "delete") {
+      if (!job.name) throw new Error("automations delete requires name")
+      const list = await deleteStoredAutomation(job.name)
+      return { id: job.id, ok: true, kind: "automations", automations: list }
+    }
+    if (job.op === "clear") {
+      await clearStoredAutomations()
+      return { id: job.id, ok: true, kind: "automations", automations: [] }
+    }
+    const list = await listStoredAutomations()
+    return { id: job.id, ok: true, kind: "automations", automations: list }
+  }
+  // LinkedIn-only jobs from here down. IMPORTANT: only these open/hijack a
+  // LinkedIn tab — never call getLinkedInTab() as a shared preamble, or an
+  // unrecognized job kind (e.g. a newer CLI command hitting an older build)
+  // would spawn linkedin.com/feed as a surprise side effect.
   if (job.kind === "probe") {
+    const tabId = await getLinkedInTab()
     await navigate(tabId, peopleSearchUrl(job.query, 1), "/search/results/people", "main")
     const data = await sendCmd(tabId, { cmd: "probe" })
     return { id: job.id, ok: true, kind: "probe", data }
   }
   if (job.kind === "probeProfile") {
+    const tabId = await getLinkedInTab()
     // If a full URL is given, navigate to it verbatim (lets us probe /details/ pages);
     // otherwise resolve a slug/name to the canonical profile URL.
     const url = /^https?:/i.test(job.target.trim())
@@ -630,17 +959,131 @@ async function runJob(job: Job): Promise<JobResult> {
     return { id: job.id, ok: true, kind: "probe", data }
   }
   if (job.kind === "search") {
+    const tabId = await getLinkedInTab()
     const hits = await runSearch(tabId, job.query, Math.max(1, job.pages))
     return { id: job.id, ok: true, kind: "search", hits }
   }
   if (job.kind === "profile") {
+    const tabId = await getLinkedInTab()
     const profile = await runProfile(tabId, job.target)
     return { id: job.id, ok: true, kind: "profile", profile }
   }
-  return { id: (job as Job).id, ok: false, error: `Unknown job kind — reload the extension to the latest build.` }
+  // Unknown kind — surface it WITHOUT any side effect (no LinkedIn tab).
+  return { id: (job as Job).id, ok: false, error: `Unknown job kind "${(job as Job).kind}" — reload the extension to the latest build.` }
 }
 
 /* ------------------------------ entry point ----------------------------- */
+
+/** Append a compact entry to the recent-job ring buffer (for the popup). */
+async function recordJob(kind: string, ok: boolean, detail: string): Promise<void> {
+  try {
+    const { jobHistory } = await chrome.storage.local.get("jobHistory")
+    const list: unknown[] = Array.isArray(jobHistory) ? jobHistory : []
+    list.unshift({ kind, ok, detail: (detail || "").slice(0, 80), at: Date.now() })
+    await chrome.storage.local.set({
+      jobHistory: list.slice(0, 15),
+      lastJobAt: Date.now(),
+      lastJobKind: kind,
+      lastJobOk: ok,
+    })
+  } catch {
+    /* storage best-effort */
+  }
+}
+
+/** One-line summary of a job for the history feed. */
+function jobDetail(job: Job): string {
+  switch (job.kind) {
+    case "read":
+      return job.url ?? "(current tab)"
+    case "search":
+      return job.query
+    case "profile":
+      return job.target
+    case "eval":
+      return job.code.replace(/\s+/g, " ").slice(0, 60)
+    case "act":
+      return job.actions.map((a) => a.action).join(", ")
+    case "monitor":
+      return job.op
+    case "logs":
+    case "network":
+      return job.tab ?? "bridge"
+    case "tabs":
+      return job.op
+    case "automations":
+      return `${job.op}${job.name ? " " + job.name : ""}${job.automation ? " " + job.automation.name : ""}`
+    default:
+      return ""
+  }
+}
+
+let autoRunLock: Promise<void> | null = null
+
+async function startLocalAutomation(name: string, input?: Record<string, unknown>): Promise<{
+  ok: boolean
+  status: string
+  summary?: string
+  error?: string
+}> {
+  if (autoRunLock) throw new Error("An automation is already running")
+  const stored = await getStoredAutomation(name)
+  if (!stored) throw new Error(`Automation "${name}" not found in extension library. Run: bridge auto sync`)
+
+  let resolveLock!: () => void
+  autoRunLock = new Promise<void>((r) => {
+    resolveLock = r
+  })
+
+  try {
+    await setAutoRun({ status: "running", name, log: [], cancel: false, at: Date.now() })
+    const result = await runRecipeInExtension({
+      recipe: stored.recipe as RecipeLike,
+      input,
+      tab: "active",
+      api: {
+        act: async (actions, tab, withSnapshot) =>
+          runActions(actions as never, tab, withSnapshot !== false, false),
+        eval: (code, arg, timeout, tab) => runEval(code, arg, timeout, tab),
+        snapshot: (tab) => runSnapshot(tab),
+      },
+      isCancelled: async () => {
+        const s = await getAutoRun()
+        return s.cancel === true
+      },
+      onProgress: (p) => {
+        void setAutoRun({
+          status: p.status === "running" ? "running" : p.status,
+          name: p.name,
+          step: p.step,
+          log: p.log.slice(-30),
+          error: p.error,
+          summary: p.summary,
+          at: Date.now(),
+        })
+      },
+    })
+    await setAutoRun({
+      status: result.status,
+      name: result.name,
+      step: result.step,
+      log: result.log.slice(-40),
+      error: result.error,
+      summary: result.summary,
+      at: Date.now(),
+    })
+    void recordJob(`auto:${name}`, result.status === "done", result.summary || result.error || "")
+    return {
+      ok: result.status === "done",
+      status: result.status,
+      summary: result.summary,
+      error: result.error,
+    }
+  } finally {
+    resolveLock()
+    autoRunLock = null
+  }
+}
 
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   // State reports from the offscreen doc (it can't write storage itself).
@@ -648,12 +1091,39 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     void chrome.storage.local.set(msg.patch as Record<string, unknown>)
     return
   }
+  if (msg?.type === "auto-list") {
+    void listStoredAutomations().then((automations) => sendResponse({ ok: true, automations }))
+    return true
+  }
+  if (msg?.type === "auto-run-state") {
+    void getAutoRun().then((state) => sendResponse({ ok: true, state }))
+    return true
+  }
+  if (msg?.type === "auto-cancel") {
+    void requestAutoCancel().then(() => sendResponse({ ok: true }))
+    return true
+  }
+  if (msg?.type === "auto-run") {
+    const name = String(msg.name || "")
+    void startLocalAutomation(name, msg.input as Record<string, unknown> | undefined)
+      .then((r) => sendResponse(r))
+      .catch((err) =>
+        sendResponse({ ok: false, status: "failed", error: err instanceof Error ? err.message : String(err) })
+      )
+    return true
+  }
   if (msg?.type !== "job") return
   const job = msg.job as Job
+  const detail = jobDetail(job)
   runJob(job)
-    .then(sendResponse)
-    .catch((err) =>
-      sendResponse({ id: job.id, ok: false, error: err instanceof Error ? err.message : String(err) })
-    )
+    .then((result) => {
+      void recordJob(job.kind, result.ok, result.ok ? detail : (result as { error: string }).error)
+      sendResponse(result)
+    })
+    .catch((err) => {
+      const message = err instanceof Error ? err.message : String(err)
+      void recordJob(job.kind, false, message)
+      sendResponse({ id: job.id, ok: false, error: message })
+    })
   return true // async response
 })

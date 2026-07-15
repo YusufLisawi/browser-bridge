@@ -1,0 +1,47 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Task detail</title>
+  <style>
+    :root { font-family: system-ui, sans-serif; color: #1a1a1a; }
+    body { max-width: 640px; margin: 2rem auto; padding: 0 1rem; }
+    .actions { margin-top: 1.5rem; display: flex; gap: 0.75rem; }
+    button.delete {
+      background: #b3261e; color: #fff; border: 0; padding: 0.55rem 1rem;
+      border-radius: 6px; cursor: pointer; font-weight: 600;
+    }
+    a.back { align-self: center; }
+    .missing { color: #666; }
+  </style>
+</head>
+<body>
+  <p><a class="back" href="./index.html">← Back to list</a></p>
+  <div id="content"></div>
+  <script src="./data.js"></script>
+  <script>
+    const id = new URLSearchParams(location.search).get("id")
+    const item = DemoStore.get(id)
+    const el = document.getElementById("content")
+    if (!item) {
+      el.innerHTML = `<p class="missing">Item ${id} not found (already deleted?).</p>
+        <p><a href="./index.html">Return to list</a></p>`
+    } else {
+      document.title = item.title
+      el.innerHTML = `
+        <h1>${item.title}</h1>
+        <p>ID: <code>${item.id}</code></p>
+        <p>${item.body}</p>
+        <div class="actions">
+          <button class="delete" data-delete type="button" aria-label="Delete">Delete</button>
+          <a class="back" href="./index.html">Cancel</a>
+        </div>
+      `
+      el.querySelector("[data-delete]").onclick = () => {
+        DemoStore.remove(id)
+        location.href = "./index.html"
+      }
+    }
+  </script>
+</body>
+</html>

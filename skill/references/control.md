@@ -62,8 +62,47 @@ Note: capture briefly activates the target tab then restores the prior one
 Verbs: `click`, `fill` (= `type`/`setValue`), `select` (by option value or
 label, uses `value`), `check`, `uncheck`, `press` (uses `key`; `target`
 optional — defaults to the focused element; `Enter` in a field submits its
-form), `hover`, `focus`, `scrollIntoView`, `waitFor` (poll for `target` up to
-`timeout`), `submit`, `getText`, `getValue`, `navigate` (uses `url`).
+form), `hover`, `focus`, `scroll` (uses `deltaY`, or `target:"top"|"bottom"`),
+`scrollIntoView`, `waitFor` (poll for `target` up to `timeout`), `waitForUrl`
+(poll until the URL contains `target` — use after a click that triggers SPA
+routing), `submit`, `getText`, `getValue`, `eval` (run JS — see below),
+`navigate` (uses `url`).
+
+By default a batch is **fail-fast**: the first failing step stops the rest
+(so step 4 never runs against the wrong state if step 3 fails). Pass
+`--continue-on-error` to run every step regardless.
+
+## Running custom JS (the "do anything" primitive)
+
+When no combination of actions fits, run arbitrary JavaScript in the page:
+
+```bash
+bridge eval 'return document.title'                 # → the title
+bridge eval 'return [...document.querySelectorAll("h2")].map(h=>h.innerText)'
+bridge eval --file scrape.js --tab active --out data.json
+bridge eval 'await fetch("/api/me").then(r=>r.json())' --json   # async + await OK
+bridge eval 'return arg.a + arg.b' --arg '{"a":1,"b":2}'        # pass data in via arg
+```
+
+- Code runs as the body of an **async function** in the page's MAIN world, so
+  `await` works and `return <value>` sends a JSON-serializable result back.
+- `--arg <json>` exposes a value to the code as `arg`.
+- `--timeout <ms>` bounds an async result (default 15000). A synchronous
+  infinite loop can't be interrupted — don't write one.
+- DOM nodes/functions aren't serializable; return plain data (strings, numbers,
+  arrays, objects). For elements, return `el.outerHTML` or extracted fields.
+
+`eval` is also an **action**, so a single batch can mix UI steps with custom
+JS and capture its result:
+```bash
+bridge act '[
+  {"action":"click","target":"e5"},
+  {"action":"waitForUrl","target":"/dashboard","timeout":10000},
+  {"action":"eval","code":"return document.querySelectorAll(\".row\").length","as":"rowCount"}
+]'
+```
+Each step's structured return appears in its result (`json`); with `--json` you
+get the full machine-readable batch back.
 
 Example — fill and submit a form:
 ```bash
@@ -78,8 +117,48 @@ bridge act '[
 
 Shortcuts (each = one act step): `bridge click <t>`, `bridge fill <t> <text>`,
 `bridge select <t> <value>`, `bridge check|uncheck <t>`, `bridge press <key> [t]`,
-`bridge navigate <url>`. Add `--no-snapshot` to skip the after-action snapshot,
-`--json`/`--out` to capture results.
+`bridge scroll [top|bottom|<px>]`, `bridge move <t>|<x> <y>`, `bridge navigate <url>`.
+Add `--no-snapshot` to skip the after-action snapshot, `--json`/`--out` to
+capture results.
+
+## Human-like interaction
+
+Synthetic events are still `isTrusted:false`, but you can pace them like a
+person — useful on sites with behavioural heuristics, and to trigger lazy
+content correctly.
+
+- `--human` on `click`/`scroll` (or `"human": true` on an act step): jittered
+  multi-step motion with randomized delays instead of one robotic jump.
+- `bridge scroll bottom --human` scrolls down in many small randomized steps
+  (with occasional re-read jitter) until the page bottom — the right way to load
+  infinite-scroll feeds.
+- `bridge move <ref|sel>` (or `bridge move <x> <y>`) glides a synthetic cursor to
+  the target along an eased, slightly-wobbly path, firing `mousemove`. Pair it
+  before a click for a more human gesture: a `click` with `"human":true` already
+  does move→pause→down→up→click.
+
+## Capturing console logs + network (no debugger banner)
+
+`monitor` arms a lightweight in-page hook (wraps `console.*`, window errors,
+`fetch`, `XMLHttpRequest`) — **no `chrome.debugger`, so no "being debugged"
+banner**. Read the buffer per tab.
+
+```bash
+bridge monitor start            # arm capture (also injects into open tabs)
+# reload / navigate the page so the hook is present from load…
+bridge logs --tab active        # console messages + uncaught errors
+bridge network --tab active     # fetch/XHR: status, method, url, timing, body
+bridge network --tab active --json --out net.json
+bridge logs --clear             # read then empty the buffer
+bridge monitor stop             # disarm
+```
+
+Fidelity limits (by design — this is the non-CDP path): it sees **app-level
+`fetch`/XHR only** (not static document/image/css/script loads), and only what
+happens **after** the hook installs (reload to capture from page load). Response
+bodies are captured truncated for text/JSON responses. For full network/CDP-level
+interception there is intentionally no support — it would require the debugger
+banner.
 
 ## Targeting tabs
 

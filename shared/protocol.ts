@@ -101,10 +101,14 @@ export interface ActionStep {
     | "hover"
     | "focus"
     | "scrollIntoView"
+    | "scroll"
+    | "mouseMove"
     | "waitFor"
+    | "waitForUrl"
     | "submit"
     | "getText"
     | "getValue"
+    | "eval"
     | "navigate"
   target?: string
   text?: string
@@ -112,6 +116,21 @@ export interface ActionStep {
   key?: string
   url?: string
   timeout?: number
+  /** action "eval": arbitrary JS run in the page (MAIN world). `return` a value. */
+  code?: string
+  /** action "eval": optional argument passed to the code as `arg`. */
+  arg?: unknown
+  /** action "eval": bind the returned value under this name in the batch's `vars`. */
+  as?: string
+  /** action "scroll": pixels to scroll vertically (default a viewport), or "top"/"bottom" via `target`. */
+  deltaY?: number
+  /** click/scroll/mouseMove: simulate human pacing — jittered multi-step motion + delays. */
+  human?: boolean
+  /** scroll: number of human sub-steps (default auto). mouseMove: path points. */
+  steps?: number
+  /** mouseMove: absolute viewport coordinates (alternative to `target`). */
+  x?: number
+  y?: number
 }
 
 /** Snapshot the interactive elements of a page (the LLM's "eyes"). */
@@ -128,6 +147,65 @@ export interface ActJob {
   actions: ActionStep[]
   tab?: TabTarget
   snapshot?: boolean
+  /** When true, keep running steps after one fails (default: fail-fast). */
+  continueOnError?: boolean
+}
+
+/**
+ * Run arbitrary JS in a page (MAIN world) and return the value. This is the
+ * extensibility primitive: an agent can write any script and execute it.
+ * The code runs as the body of an async function — use `return` to send a
+ * (JSON-serializable) value back, and `await` freely. `arg` is exposed as `arg`.
+ */
+export interface EvalJob {
+  id: string
+  kind: "eval"
+  code: string
+  tab?: TabTarget
+  arg?: unknown
+  /** Max ms to await an async result before erroring (default 15000). */
+  timeout?: number
+}
+
+/**
+ * Console + network capture (NON-CDP — no chrome.debugger, no banner).
+ * `monitor` arms/disarms a MAIN-world hook that wraps console.*, window
+ * errors, fetch and XHR; `logs`/`network` read the per-page buffer back.
+ * Fidelity note: captures app-level fetch/XHR (not static resource loads) and
+ * only what happens after the hook installs (reload to capture from page load).
+ */
+export interface MonitorJob {
+  id: string
+  kind: "monitor"
+  op: "start" | "stop" | "status"
+}
+
+export interface CaptureJob {
+  id: string
+  kind: "logs" | "network"
+  tab?: TabTarget
+  /** Clear the buffer after reading. */
+  clear?: boolean
+}
+
+/** Automation synced into the extension for popup listing / one-click replay. */
+export interface StoredAutomation {
+  name: string
+  description?: string
+  /** Hostnames for grouping in the popup (e.g. "example.com", "127.0.0.1"). */
+  sites: string[]
+  /** Full recipe object (JSON-serializable). */
+  recipe: unknown
+  updatedAt: number
+}
+
+/** Push / remove / list automations in extension storage (popup library). */
+export interface AutomationsJob {
+  id: string
+  kind: "automations"
+  op: "upsert" | "delete" | "list" | "clear"
+  automation?: StoredAutomation
+  name?: string
 }
 
 export type Job =
@@ -139,8 +217,12 @@ export type Job =
   | ReadJob
   | SnapshotJob
   | ActJob
+  | EvalJob
+  | MonitorJob
+  | CaptureJob
   | TabsJob
   | ScreenshotJob
+  | AutomationsJob
 
 /* ------------------------------ Results --------------------------------- */
 
@@ -217,12 +299,34 @@ export interface SnapNode {
   disabled?: boolean
 }
 
+/** One captured console message or page error. */
+export interface LogEntry {
+  level: string
+  text: string
+  t: number
+}
+
+/** One captured network call (app-level fetch/XHR). */
+export interface NetEntry {
+  type: string
+  method: string
+  url: string
+  status: number
+  ms: number
+  t: number
+  error?: string
+  /** Response body, truncated, when small + text/JSON. */
+  body?: string
+}
+
 /** Outcome of a single action step. */
 export interface StepResult {
   action: string
   target?: string
   ok: boolean
   value?: string
+  /** Structured result (e.g. from an "eval" or "getValue" step). */
+  json?: unknown
   error?: string
 }
 
@@ -234,6 +338,11 @@ export type JobResult =
   | { id: string; ok: true; kind: "read"; page: PageContent }
   | { id: string; ok: true; kind: "snapshot"; url: string; title: string; elements: SnapNode[] }
   | { id: string; ok: true; kind: "act"; url: string; results: StepResult[]; snapshot?: SnapNode[] }
+  | { id: string; ok: true; kind: "eval"; url: string; value: unknown }
+  | { id: string; ok: true; kind: "monitor"; active: boolean }
+  | { id: string; ok: true; kind: "logs"; url: string; logs: LogEntry[] }
+  | { id: string; ok: true; kind: "network"; url: string; requests: NetEntry[] }
   | { id: string; ok: true; kind: "tabs"; tabs: TabInfo[] }
   | { id: string; ok: true; kind: "screenshot"; dataUrl: string }
+  | { id: string; ok: true; kind: "automations"; automations: StoredAutomation[] }
   | { id: string; ok: false; error: string }

@@ -10,8 +10,12 @@
 import { WS_URL, type Job, type JobResult } from "../../shared/protocol"
 
 let socket: WebSocket | null = null
-let backoff = 1000
+let attempt = 0
 const MAX_BACKOFF = 8000
+// The CLI server only exists for the brief window a command runs, so the first
+// few reconnects are fast (catch the window quickly); an idle browser then
+// backs off so it isn't re-dialing a dead port forever.
+const nextDelay = (n: number) => (n < 4 ? 250 : Math.min(250 * 2 ** (n - 3), MAX_BACKOFF))
 
 /** Send a state patch to the SW (which writes it to chrome.storage). */
 const report = (patch: Record<string, unknown>) => {
@@ -34,8 +38,8 @@ const connect = () => {
   }
 
   socket.addEventListener("open", () => {
-    backoff = 1000
-    report({ wsConnected: true, wsLastError: null })
+    attempt = 0
+    report({ wsConnected: true, wsLastError: null, wsConnectedAt: Date.now() })
   })
 
   socket.addEventListener("message", async (event) => {
@@ -61,8 +65,8 @@ const connect = () => {
 }
 
 const scheduleReconnect = () => {
-  setTimeout(connect, backoff)
-  backoff = Math.min(backoff * 2, MAX_BACKOFF)
+  setTimeout(connect, nextDelay(attempt))
+  attempt += 1
 }
 
 connect()

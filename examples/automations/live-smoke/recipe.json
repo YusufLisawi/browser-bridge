@@ -1,0 +1,67 @@
+{
+  "name": "live-smoke",
+  "description": "Live browser smoke: navigate example.com, collect links, log each",
+  "version": 1,
+  "tab": "bridge",
+  "vars": {
+    "seen": 0
+  },
+  "defaults": {
+    "timeout": 15000,
+    "noSnapshot": true,
+    "retry": { "times": 1, "delayMs": 500 }
+  },
+  "steps": [
+    {
+      "id": "go",
+      "action": "navigate",
+      "url": "https://example.com/"
+    },
+    {
+      "id": "title",
+      "action": "eval",
+      "code": "return document.title",
+      "as": "title"
+    },
+    {
+      "id": "log-title",
+      "action": "log",
+      "message": "page title: ${vars.title}"
+    },
+    {
+      "id": "collect",
+      "action": "eval",
+      "code": "return [...document.querySelectorAll('a[href]')].slice(0, 5).map((a, i) => ({ i, text: (a.textContent||'').trim(), href: a.href }))",
+      "as": "links"
+    },
+    {
+      "id": "each-link",
+      "foreach": "${vars.links}",
+      "as": "link",
+      "steps": [
+        {
+          "action": "log",
+          "message": "link ${link.i}: ${link.text} → ${link.href}"
+        },
+        {
+          "action": "set",
+          "var": "seen",
+          "expr": "vars.seen + 1"
+        }
+      ]
+    },
+    {
+      "id": "when-ok",
+      "when": "vars.seen > 0",
+      "steps": [
+        { "action": "log", "message": "when-branch: saw links" }
+      ],
+      "else": [
+        { "action": "log", "message": "when-branch: no links (unexpected)" }
+      ]
+    }
+  ],
+  "onComplete": {
+    "summary": "Live smoke ok — title=${vars.title}; links=${vars.seen}"
+  }
+}

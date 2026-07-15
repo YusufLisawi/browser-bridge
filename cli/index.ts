@@ -13,6 +13,7 @@ import TurndownService from "turndown"
 import type { ActionStep, Job, JobResult, SnapNode, TabTarget } from "../shared/protocol.js"
 import { dispatch, dispatchBatch } from "./server.js"
 import { assertWithinLimit, recordUsage, remainingFor } from "./ratelimit.js"
+import { handleAutomation } from "./automations/commands.js"
 
 const turndown = new TurndownService({
   headingStyle: "atx",
@@ -32,6 +33,11 @@ interface Flags {
   links: boolean
   tab: TabTarget
   noSnapshot: boolean
+  continueOnError: boolean
+  human: boolean
+  clear: boolean
+  arg: string | null
+  timeout: number | null
   positional: string[]
 }
 
@@ -47,6 +53,11 @@ function parseFlags(args: string[]): Flags {
     links: false,
     tab: "bridge",
     noSnapshot: false,
+    continueOnError: false,
+    human: false,
+    clear: false,
+    arg: null,
+    timeout: null,
     positional: [],
   }
   for (let i = 0; i < args.length; i += 1) {
@@ -61,6 +72,11 @@ function parseFlags(args: string[]): Flags {
     else if (a === "--links") flags.links = true
     else if (a === "--tab") flags.tab = args[++i] ?? "bridge"
     else if (a === "--no-snapshot") flags.noSnapshot = true
+    else if (a === "--continue-on-error") flags.continueOnError = true
+    else if (a === "--human") flags.human = true
+    else if (a === "--clear") flags.clear = true
+    else if (a === "--arg") flags.arg = args[++i] ?? null
+    else if (a === "--timeout") flags.timeout = parseInt(args[++i] ?? "", 10) || null
     else flags.positional.push(a)
   }
   return flags
@@ -102,6 +118,22 @@ Usage:
   bridge select <ref|sel> <value>              Pick a <select> option
   bridge check|uncheck <ref|sel>               Toggle a checkbox/radio
   bridge press <key> [ref|sel]                 Press a key (Enter, Tab, Escape…)
+  bridge scroll [top|bottom|<px>] [--human]    Scroll (--human = jittered multi-step)
+  bridge move <ref|sel> | <x> <y>              Move the mouse (human path) to a target
+
+  Scripting (run any JS — the "do anything" primitive):
+  bridge eval '<js>' [--tab x] [--arg json]    Run JS in the page; 'return' a value
+  bridge eval --file script.js [--timeout ms]  Run a JS file (async + await supported)
+
+  Capture (console + network, no debugger banner):
+  bridge monitor start|stop|status             Arm/disarm console + network capture
+  bridge logs [--tab x] [--clear]              Show captured console logs + errors
+  bridge network [--tab x] [--clear]           Show captured fetch/XHR requests
+
+  Automations (reusable recipes — alias: bridge auto):
+  bridge automation list|show|save|delete      Manage ~/.browser-bridge/automations
+  bridge automation run <name> [--wait|--detach] [--var k=v]
+  bridge automation status|wait|cancel|runs    Inspect / await background runs
 
   LinkedIn:
   bridge search <query...> [--pages N]         People-search results
@@ -111,6 +143,11 @@ Usage:
 Options:
   --tab active  control: act on your active tab instead of the bridge tab
   --no-snapshot control: skip the after-action snapshot
+  --continue-on-error  act: keep running steps after one fails (default: stop)
+  --human       click/scroll/move: simulate human pacing (jittered motion + delays)
+  --clear       logs/network: clear the buffer after reading
+  --arg JSON    eval: value exposed to the script as 'arg' (JSON or string)
+  --timeout MS  eval: max time to await an async result (default 15000)
   --pages N     search: number of result pages (default 1)
   --file PATH   profiles/read: read targets from a file (one per line, # = comment)
   --limit N     crawl: max links to follow (default 20)
@@ -417,12 +454,35 @@ function emitControl(r: JobResult, flags: Flags): void {
     log(`✗ ${r.error}`)
     return
   }
-  if (r.kind === "snapshot") {
+  if (r.kind === "monitor") {
+    log(
+      r.active
+        ? "✓ Monitoring armed — console + network capture on.\n  Reload open pages (or navigate) to capture from page load, then `bridge logs` / `bridge network`."
+        : "✓ Monitoring stopped."
+    )
+  } else if (r.kind === "logs") {
+    log(`# logs <${r.url}> — ${r.logs.length} entr${r.logs.length === 1 ? "y" : "ies"}\n`)
+    for (const l of r.logs) {
+      const ts = new Date(l.t).toLocaleTimeString()
+      log(`  ${ts} [${l.level}] ${l.text}`)
+    }
+    if (!r.logs.length) log("  (none — is `bridge monitor start` armed and the page reloaded?)")
+  } else if (r.kind === "network") {
+    log(`# network <${r.url}> — ${r.requests.length} request(s)\n`)
+    for (const n of r.requests) {
+      const status = n.status || "ERR"
+      log(`  ${status} ${n.method.padEnd(4)} ${n.url}  (${n.ms}ms)${n.error ? " — " + n.error : ""}`)
+    }
+    if (!r.requests.length) log("  (none — is `bridge monitor start` armed and the page reloaded?)")
+  } else if (r.kind === "snapshot") {
     log(`# ${r.title}\n<${r.url}>  — ${r.elements.length} interactive element(s)\n`)
     log(fmtSnapshot(r.elements))
+  } else if (r.kind === "eval") {
+    log(typeof r.value === "string" ? r.value : JSON.stringify(r.value, null, 2))
   } else if (r.kind === "act") {
     for (const s of r.results) {
-      const val = s.value != null ? ` = ${JSON.stringify(s.value)}` : ""
+      const out = s.json !== undefined ? s.json : s.value
+      const val = out != null ? ` = ${typeof out === "string" ? out : JSON.stringify(out)}` : ""
       const err = s.error ? ` — ${s.error}` : ""
       log(`${s.ok ? "✓" : "✗"} ${s.action}${s.target ? " " + s.target : ""}${val}${err}`)
     }
@@ -442,11 +502,50 @@ function fmtTabs(tabs: { id: number; active: boolean; title: string; url: string
 /** Build + dispatch a single-step act job (used by the shortcut commands). */
 async function runAct(actions: ActionStep[], flags: Flags): Promise<void> {
   const r = await dispatch(
-    { id: randomUUID(), kind: "act", actions, tab: flags.tab, snapshot: !flags.noSnapshot },
+    {
+      id: randomUUID(),
+      kind: "act",
+      actions,
+      tab: flags.tab,
+      snapshot: !flags.noSnapshot,
+      continueOnError: flags.continueOnError,
+    },
     { onWaiting }
   )
   emitControl(r, flags)
   process.exit(r.ok && (r.kind !== "act" || r.results.every((s) => s.ok)) ? 0 : 1)
+}
+
+/** bridge eval — run arbitrary JS in a tab (MAIN world) and print the value. */
+async function runEvalCmd(flags: Flags): Promise<void> {
+  const code = flags.file ? readFileSync(flags.file, "utf8") : flags.positional.join(" ").trim()
+  if (!code) throw new Error('Provide JS, e.g. bridge eval "return document.title"  (or --file script.js)')
+  let arg: unknown
+  if (flags.arg != null) {
+    try {
+      arg = JSON.parse(flags.arg)
+    } catch {
+      arg = flags.arg // treat as a plain string
+    }
+  }
+  const r = await dispatch(
+    {
+      id: randomUUID(),
+      kind: "eval",
+      code,
+      tab: flags.tab,
+      arg,
+      timeout: flags.timeout ?? undefined,
+    },
+    { onWaiting, timeoutMs: (flags.timeout ?? 15000) + 5000 }
+  )
+  if (flags.out) {
+    writeFileSync(flags.out, JSON.stringify(r, null, 2))
+    log(`Wrote ${flags.out}`)
+  }
+  if (flags.json) log(JSON.stringify(r, null, 2))
+  else emitControl(r, flags)
+  process.exit(r.ok ? 0 : 1)
 }
 
 async function main() {
@@ -455,6 +554,11 @@ async function main() {
 
   if (!command || command === "help" || command === "--help" || command === "-h") {
     printHelp()
+    return
+  }
+
+  if (command === "automation" || command === "auto") {
+    await handleAutomation(rest)
     return
   }
 
@@ -525,7 +629,20 @@ async function main() {
   // Ergonomic single-action shortcuts.
   if (command === "click") {
     if (!flags.positional[0]) throw new Error("Usage: bridge click <ref|selector>")
-    await runAct([{ action: "click", target: flags.positional[0] }], flags)
+    await runAct([{ action: "click", target: flags.positional[0], human: flags.human }], flags)
+    return
+  }
+  if (command === "move") {
+    // bridge move <ref|sel>   |   bridge move <x> <y>
+    const a0 = flags.positional[0]
+    if (!a0) throw new Error("Usage: bridge move <ref|selector>  or  bridge move <x> <y>")
+    const x = parseInt(a0, 10)
+    const y = parseInt(flags.positional[1] ?? "", 10)
+    const step: ActionStep =
+      flags.positional.length >= 2 && !Number.isNaN(x) && !Number.isNaN(y)
+        ? { action: "mouseMove", x, y, human: true }
+        : { action: "mouseMove", target: a0, human: true }
+    await runAct([step], flags)
     return
   }
   if (command === "fill" || command === "type") {
@@ -557,6 +674,36 @@ async function main() {
     if (!url) throw new Error("Usage: bridge navigate <url>")
     await runAct([{ action: "navigate", url }], flags)
     return
+  }
+  if (command === "eval" || command === "exec") {
+    await runEvalCmd(flags)
+    return
+  }
+  if (command === "scroll") {
+    // bridge scroll [top|bottom|<px>] [--human]
+    const arg = flags.positional[0]
+    const step: ActionStep =
+      arg === "top" || arg === "bottom"
+        ? { action: "scroll", target: arg, human: flags.human }
+        : { action: "scroll", deltaY: arg ? parseInt(arg, 10) || undefined : undefined, human: flags.human }
+    await runAct([step], flags)
+    return
+  }
+  if (command === "monitor") {
+    const op = (flags.positional[0] as "start" | "stop" | "status") || "status"
+    if (!["start", "stop", "status"].includes(op))
+      throw new Error("Usage: bridge monitor <start|stop|status>")
+    const r = await dispatch({ id: randomUUID(), kind: "monitor", op }, { onWaiting })
+    emitControl(r, flags)
+    process.exit(r.ok ? 0 : 1)
+  }
+  if (command === "logs" || command === "network") {
+    const r = await dispatch(
+      { id: randomUUID(), kind: command as "logs" | "network", tab: flags.tab, clear: flags.clear },
+      { onWaiting }
+    )
+    emitControl(r, flags)
+    process.exit(r.ok ? 0 : 1)
   }
 
   let job: Job

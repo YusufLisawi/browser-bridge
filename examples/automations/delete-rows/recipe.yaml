@@ -1,0 +1,51 @@
+name: delete-rows
+description: Template — open each collected row, click delete, return to the list
+version: 1
+tab: active
+vars:
+  deleted: 0
+  failed: []
+input:
+  limit:
+    type: number
+    default: 20
+defaults:
+  timeout: 15000
+  human: true
+  retry:
+    times: 2
+    delayMs: 800
+  onFail: abort
+  noSnapshot: true
+steps:
+  - id: collect
+    action: eval
+    code: |
+      return [...document.querySelectorAll('[data-row] a, tr a')]
+        .slice(0, arg.limit)
+        .map((a, i) => ({ index: i, href: a.href }))
+    arg:
+      limit: "${input.limit}"
+    as: rows
+
+  - id: each-row
+    foreach: "${vars.rows}"
+    as: row
+    steps:
+      - action: navigate
+        url: "${row.href}"
+      - action: waitFor
+        target: "button[data-delete], [aria-label='Delete'], button"
+        timeout: 10000
+      - action: click
+        target: "button[data-delete], [aria-label='Delete']"
+        onFail: continue
+      - action: waitForUrl
+        target: "/list"
+        onFail: continue
+      - action: set
+        var: deleted
+        expr: "vars.deleted + 1"
+
+onComplete:
+  summary: "Deleted ${vars.deleted} rows; failed: ${vars.failed}"

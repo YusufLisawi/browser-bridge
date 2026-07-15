@@ -18,6 +18,7 @@ const entryPoints = {
   offscreen: resolve(srcDir, "offscreen.ts"),
   content: resolve(srcDir, "content.ts"),
   popup: resolve(srcDir, "popup.ts"),
+  capture: resolve(srcDir, "capture.ts"),
 }
 
 const staticAssets = [

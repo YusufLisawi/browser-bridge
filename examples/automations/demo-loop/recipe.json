@@ -1,0 +1,23 @@
+{
+  "name": "demo-loop",
+  "description": "Offline foreach demo — no browser required",
+  "version": 1,
+  "vars": {
+    "deleted": 0,
+    "rows": [{ "id": 1 }, { "id": 2 }, { "id": 3 }]
+  },
+  "steps": [
+    {
+      "id": "each-row",
+      "foreach": "${vars.rows}",
+      "as": "row",
+      "steps": [
+        { "action": "log", "message": "processing row ${row.id}" },
+        { "action": "set", "var": "deleted", "expr": "vars.deleted + 1" }
+      ]
+    }
+  ],
+  "onComplete": {
+    "summary": "Deleted ${vars.deleted} rows"
+  }
+}

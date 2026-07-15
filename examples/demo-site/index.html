@@ -1,0 +1,45 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Demo Tasks</title>
+  <style>
+    :root { font-family: system-ui, sans-serif; color: #1a1a1a; }
+    body { max-width: 640px; margin: 2rem auto; padding: 0 1rem; }
+    h1 { font-size: 1.4rem; }
+    table { width: 100%; border-collapse: collapse; margin-top: 1rem; }
+    th, td { text-align: left; padding: 0.55rem 0.4rem; border-bottom: 1px solid #ddd; }
+    a { color: #0b57d0; }
+    .meta { color: #666; font-size: 0.9rem; }
+    button.reset { margin-top: 1rem; }
+  </style>
+</head>
+<body>
+  <h1>Demo Tasks</h1>
+  <p class="meta">Local demo for browser-bridge automations. Each row opens a detail page with Delete.</p>
+  <p class="meta">Remaining: <strong id="count">0</strong></p>
+  <table>
+    <thead><tr><th>ID</th><th>Title</th><th></th></tr></thead>
+    <tbody id="rows"></tbody>
+  </table>
+  <button class="reset" id="reset" type="button">Reset demo data</button>
+  <script src="./data.js"></script>
+  <script>
+    function render() {
+      const items = DemoStore.list()
+      document.getElementById("count").textContent = String(items.length)
+      const tbody = document.getElementById("rows")
+      tbody.innerHTML = items.map((item) => `
+        <tr data-row data-id="${item.id}">
+          <td>${item.id}</td>
+          <td><a href="./item.html?id=${encodeURIComponent(item.id)}">${item.title}</a></td>
+          <td><a href="./item.html?id=${encodeURIComponent(item.id)}">Open</a></td>
+        </tr>
+      `).join("") || `<tr><td colspan="3"><em>All deleted. Click Reset.</em></td></tr>`
+    }
+    document.getElementById("reset").onclick = () => { DemoStore.reset(); render() }
+    DemoStore.ensure()
+    render()
+  </script>
+</body>
+</html>

@@ -1,10 +1,13 @@
 # Browser Bridge
 
 A local CLI (`bridge`) that drives your **own logged-in** browser through a
-vanilla MV3 Chrome extension, over a local WebSocket. Point it at any URL and
-get the page back as clean **Markdown**, follow a page's links and fetch each as
-Markdown, or use the built-in **LinkedIn** helpers (people search + profile
-scrape). Designed so an agent reads tidy Markdown instead of parsing raw HTML.
+vanilla MV3 Chrome extension, over a local WebSocket. Read any URL as clean
+**Markdown**, follow links, **snapshot** a page's interactive elements and
+**act** on them (click/fill/select/scroll), capture **screenshots**, run
+**arbitrary JS** in a page (`bridge eval` — the "do anything" primitive), or use
+the built-in **LinkedIn** helpers (people search + profile scrape). Designed so
+an agent reads tidy Markdown instead of parsing raw HTML, and can script
+end-to-end browser automations.
 
 ```
   terminal:  bridge read "https://example.com/article"
@@ -32,10 +35,11 @@ private and don't run this on an account you can't afford to lose.
 ## Setup
 
 ```bash
-cd ~/Developer/linkedin-bridge        # (folder name kept; project is "browser-bridge")
+cd ~/Developer/browser-bridge
 npm install
 npm run build          # builds CLI -> dist-cli, extension -> extension/dist
-npm link               # optional: makes `bridge` available globally
+# put `bridge` on your PATH (no npm needed):
+ln -sfn "$PWD/dist-cli/cli/index.js" ~/.local/bin/bridge
 ```
 
 Load the extension:
@@ -55,11 +59,38 @@ bridge read "https://a.com" "https://b.com" --out pages.md   # bulk
 bridge read --file urls.txt --out pages.json --links
 bridge crawl "https://docs.site.com" --limit 15 --same-host --out docs.json
 
+# Drive a page — see it, then act on it
+bridge navigate "https://example.com/login" --tab active
+bridge snapshot                              # interactive elements → refs e1,e2…
+bridge act '[{"action":"fill","target":"e1","text":"jane@co.com"},
+             {"action":"click","target":"e5"},
+             {"action":"waitForUrl","target":"/dashboard"}]'
+bridge scroll bottom
+
+# Run any JS in the page (the "do anything" primitive)
+bridge eval 'return document.title'
+bridge eval --file scrape.js --tab active --json --out data.json
+bridge eval 'return arg.x * 2' --arg '{"x":21}'
+
+# Automations — reusable recipes (learn once, run unattended)
+bridge auto save demo-loop --file examples/automations/demo-loop/recipe.json --force
+bridge auto run demo-loop                          # --wait by default
+bridge auto run delete-rows --var limit=20 --detach
+bridge auto status                                 # latest run
+# See skill/references/automations.md
+
 # LinkedIn helpers
 bridge search "react developer berlin" --pages 2
 bridge profile "https://www.linkedin.com/in/some-slug"
 bridge profiles --file leads.txt --out leads.json
 ```
+
+### Automations
+
+Save repetitive flows (foreach + waits + retries) under
+`~/.browser-bridge/automations/`. Agents write a recipe after figuring out the
+flow once, then `bridge auto run` with `--wait` or `--detach`. Details:
+[skill/references/automations.md](skill/references/automations.md).
 
 Flags: `--pages N` (search) · `--file PATH` · `--limit N` / `--same-host` (crawl)
 · `--links` (read) · `--json` · `--out FILE` (`.json` → JSON, else Markdown).

@@ -1,0 +1,96 @@
+{
+  "name": "demo-delete-rows",
+  "description": "Delete each task on the local demo site (list → detail → Delete → back)",
+  "version": 1,
+  "tab": "bridge",
+  "sites": ["127.0.0.1"],
+  "vars": {
+    "deleted": 0,
+    "failed": []
+  },
+  "input": {
+    "base": { "type": "string", "default": "http://127.0.0.1:8765" },
+    "limit": { "type": "number", "default": 20 }
+  },
+  "defaults": {
+    "timeout": 15000,
+    "human": false,
+    "noSnapshot": true,
+    "retry": { "times": 1, "delayMs": 400 },
+    "onFail": "abort"
+  },
+  "steps": [
+    {
+      "id": "open-list",
+      "action": "navigate",
+      "url": "${input.base}/index.html"
+    },
+    {
+      "id": "reset-data",
+      "action": "eval",
+      "code": "DemoStore.reset(); return DemoStore.list().length",
+      "as": "seeded"
+    },
+    {
+      "id": "log-seed",
+      "action": "log",
+      "message": "seeded ${vars.seeded} rows"
+    },
+    {
+      "id": "collect",
+      "action": "eval",
+      "code": "return [...document.querySelectorAll('tr[data-row]')].slice(0, arg.limit).map((tr, i) => ({ index: i, id: tr.getAttribute('data-id'), href: tr.querySelector('a')?.href }))",
+      "arg": { "limit": "${input.limit}" },
+      "as": "rows"
+    },
+    {
+      "id": "each-row",
+      "foreach": "${vars.rows}",
+      "as": "row",
+      "steps": [
+        {
+          "action": "log",
+          "message": "deleting row ${row.id} (${row.href})"
+        },
+        {
+          "action": "navigate",
+          "url": "${row.href}"
+        },
+        {
+          "action": "waitFor",
+          "target": "button[data-delete], button[aria-label='Delete']",
+          "timeout": 8000
+        },
+        {
+          "action": "click",
+          "target": "button[data-delete]",
+          "onFail": "continue"
+        },
+        {
+          "action": "waitForUrl",
+          "target": "index.html",
+          "timeout": 8000
+        },
+        {
+          "action": "set",
+          "var": "deleted",
+          "expr": "vars.deleted + 1"
+        }
+      ]
+    },
+    {
+      "id": "verify",
+      "action": "eval",
+      "code": "return { remaining: DemoStore.list().length, countText: document.getElementById('count')?.textContent }",
+      "as": "verify"
+    },
+    {
+      "id": "log-verify",
+      "action": "log",
+      "message": "verify remaining=${vars.verify}"
+    }
+  ],
+  "onComplete": {
+    "summary": "Deleted ${vars.deleted}/${vars.seeded} rows; remaining=${vars.verify}"
+  }
+}
