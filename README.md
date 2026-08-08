@@ -12,7 +12,7 @@ end-to-end browser automations.
 ```
   terminal:  bridge read "https://example.com/article"
                 │
-   WS :8787 ◄───┘
+   WS :38471 ◄───┘
       │
   ┌───┴───────────────────────────────────────────────────┐
   │ Extension                                               │
@@ -102,10 +102,12 @@ need re-tuning.
 
 ### How it connects
 
-Each `bridge` command starts a one-shot WebSocket **server** on `127.0.0.1:8787`.
-The extension is the **client** and reconnects automatically, so just keep
-Chrome open — no daemon to run. Generic reads use a dedicated background "bridge
-tab" so they don't disturb your active tab.
+Each `bridge` command starts a one-shot WebSocket **server** on `127.0.0.1:38471`
+(chosen to avoid common local-tool collisions on ports like `8787`). Concurrent
+agents **queue** via `~/.browser-bridge/bridge.lock` — only one drives the
+browser at a time. The extension is the **client** and reconnects automatically,
+so just keep Chrome open — no daemon to run. Generic reads use a dedicated
+background "bridge tab" so they don't disturb your active tab.
 
 ## Development
 

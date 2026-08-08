@@ -15,7 +15,6 @@ import type {
   PageContent,
   ProfileData,
   SearchHit,
-  StoredAutomation,
 } from "../../shared/protocol"
 import type { ContentCommand } from "./content"
 import { runRecipeInExtension, type RecipeLike } from "./auto-runner"
@@ -31,6 +30,72 @@ import {
 } from "./auto-store"
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms))
+
+/** Hint appended to scripting/capture timeouts so agents reload instead of retry-spamming. */
+const RELOAD_HINT =
+  "reload Browser Bridge in chrome://extensions, then retry"
+
+const SCRIPT_TIMEOUT_MS = 45000
+const SCREENSHOT_TIMEOUT_MS = 20000
+
+function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(
+      () => reject(new Error(`${label} timed out after ${ms}ms — ${RELOAD_HINT}`)),
+      ms
+    )
+    promise.then(
+      (v) => {
+        clearTimeout(timer)
+        resolve(v)
+      },
+      (err) => {
+        clearTimeout(timer)
+        reject(err)
+      }
+    )
+  })
+}
+
+/* ------------------------ global job queue + keepalive ------------------- */
+
+/** Serialize all browser work (CLI jobs + popup automations). Never parallel. */
+let jobChain: Promise<unknown> = Promise.resolve()
+let activeJobs = 0
+let keepaliveTimer: ReturnType<typeof setInterval> | null = null
+
+function startKeepalive(): void {
+  if (keepaliveTimer) return
+  // Touch a chrome API so MV3 is less likely to sleep mid-executeScript.
+  keepaliveTimer = setInterval(() => {
+    void chrome.runtime.getPlatformInfo().catch(() => {})
+  }, 20000)
+}
+
+function stopKeepalive(): void {
+  if (!keepaliveTimer) return
+  clearInterval(keepaliveTimer)
+  keepaliveTimer = null
+}
+
+function enqueue<T>(fn: () => Promise<T>): Promise<T> {
+  const run = jobChain.then(async () => {
+    activeJobs += 1
+    startKeepalive()
+    try {
+      return await fn()
+    } finally {
+      activeJobs -= 1
+      if (activeJobs === 0) stopKeepalive()
+    }
+  })
+  // Keep the chain alive even if a job fails.
+  jobChain = run.then(
+    () => undefined,
+    () => undefined
+  )
+  return run
+}
 
 /* ----------------------------- offscreen -------------------------------- */
 
@@ -245,10 +310,14 @@ async function runRead(url?: string, tab?: string): Promise<PageContent> {
     await waitForComplete(tabId, host, 30000)
     await sleep(800)
   }
-  const [injection] = await chrome.scripting.executeScript({
-    target: { tabId },
-    func: extractReadable,
-  })
+  const [injection] = await withTimeout(
+    chrome.scripting.executeScript({
+      target: { tabId },
+      func: extractReadable,
+    }),
+    SCRIPT_TIMEOUT_MS,
+    "read"
+  )
   if (!injection?.result) throw new Error(`Could not read page${url ? `: ${url}` : ""}`)
   return injection.result as PageContent
 }
@@ -605,12 +674,17 @@ async function runEval(
   target?: string
 ): Promise<{ url: string; value: unknown }> {
   const tabId = await resolveTab(target)
-  const [inj] = await chrome.scripting.executeScript({
-    target: { tabId },
-    world: "MAIN",
-    func: bbEval,
-    args: [{ code, arg, timeout }],
-  })
+  const injectTimeout = Math.max(SCRIPT_TIMEOUT_MS, (timeout ?? 15000) + 5000)
+  const [inj] = await withTimeout(
+    chrome.scripting.executeScript({
+      target: { tabId },
+      world: "MAIN",
+      func: bbEval,
+      args: [{ code, arg, timeout }],
+    }),
+    injectTimeout,
+    "eval"
+  )
   const r = (inj?.result ?? { ok: false, error: "no result" }) as {
     ok: boolean
     value?: unknown
@@ -669,7 +743,11 @@ async function runScreenshot(target?: string): Promise<string> {
     await chrome.tabs.update(tabId, { active: true })
     await sleep(200)
   }
-  const dataUrl = await chrome.tabs.captureVisibleTab(windowId, { format: "png" })
+  const dataUrl = await withTimeout(
+    chrome.tabs.captureVisibleTab(windowId, { format: "png" }),
+    SCREENSHOT_TIMEOUT_MS,
+    "screenshot"
+  )
   if (prevActive?.id != null && prevActive.id !== tabId) {
     await chrome.tabs.update(prevActive.id, { active: true })
   }
@@ -678,7 +756,11 @@ async function runScreenshot(target?: string): Promise<string> {
 
 async function runSnapshot(target?: string) {
   const tabId = await resolveTab(target)
-  const [inj] = await chrome.scripting.executeScript({ target: { tabId }, func: bbExec, args: [{ op: "snapshot" }] })
+  const [inj] = await withTimeout(
+    chrome.scripting.executeScript({ target: { tabId }, func: bbExec, args: [{ op: "snapshot" }] }),
+    SCRIPT_TIMEOUT_MS,
+    "snapshot"
+  )
   return inj.result as { url: string; title: string; elements: unknown[] }
 }
 
@@ -698,20 +780,29 @@ async function runActions(actions: any[], target?: string, withSnapshot = true, 
       result = { action: "navigate", target: step.url, ok: true }
     } else if (step.action === "eval") {
       // Arbitrary JS, MAIN world — same engine as the standalone eval job.
-      const [inj] = await chrome.scripting.executeScript({
-        target: { tabId },
-        world: "MAIN",
-        func: bbEval,
-        args: [{ code: step.code ?? "", arg: step.arg, timeout: step.timeout }],
-      })
+      const stepTimeout = step.timeout ?? 15000
+      const [inj] = await withTimeout(
+        chrome.scripting.executeScript({
+          target: { tabId },
+          world: "MAIN",
+          func: bbEval,
+          args: [{ code: step.code ?? "", arg: step.arg, timeout: stepTimeout }],
+        }),
+        Math.max(SCRIPT_TIMEOUT_MS, stepTimeout + 5000),
+        "act.eval"
+      )
       const r = (inj?.result ?? { ok: false, error: "no result" }) as any
       result = { action: "eval", target: step.as, ok: !!r.ok, json: r.value, error: r.error }
     } else {
-      const [inj] = await chrome.scripting.executeScript({
-        target: { tabId },
-        func: bbExec,
-        args: [{ op: "act", step }],
-      })
+      const [inj] = await withTimeout(
+        chrome.scripting.executeScript({
+          target: { tabId },
+          func: bbExec,
+          args: [{ op: "act", step }],
+        }),
+        SCRIPT_TIMEOUT_MS,
+        `act.${step.action ?? "step"}`
+      )
       result = inj.result
       // getText/getValue return a string `value`; also expose it as json for parsing.
       if (result && result.value != null && result.json == null) result.json = result.value
@@ -722,7 +813,11 @@ async function runActions(actions: any[], target?: string, withSnapshot = true, 
   }
   const out: any = { url: (await chrome.tabs.get(tabId)).url, results }
   if (withSnapshot) {
-    const [snap] = await chrome.scripting.executeScript({ target: { tabId }, func: bbExec, args: [{ op: "snapshot" }] })
+    const [snap] = await withTimeout(
+      chrome.scripting.executeScript({ target: { tabId }, func: bbExec, args: [{ op: "snapshot" }] }),
+      SCRIPT_TIMEOUT_MS,
+      "act.snapshot"
+    )
     out.snapshot = (snap.result as any).elements
   }
   return out
@@ -1018,7 +1113,7 @@ function jobDetail(job: Job): string {
   }
 }
 
-let autoRunLock: Promise<void> | null = null
+let autoRunActive = false
 
 async function startLocalAutomation(name: string, input?: Record<string, unknown>): Promise<{
   ok: boolean
@@ -1026,63 +1121,63 @@ async function startLocalAutomation(name: string, input?: Record<string, unknown
   summary?: string
   error?: string
 }> {
-  if (autoRunLock) throw new Error("An automation is already running")
-  const stored = await getStoredAutomation(name)
-  if (!stored) throw new Error(`Automation "${name}" not found in extension library. Run: bridge auto sync`)
+  // Entire automation (all browser steps) runs as one queued unit so CLI jobs
+  // cannot interleave mid-recipe. Reject a second popup run while one is active.
+  return enqueue(async () => {
+    if (autoRunActive) throw new Error("An automation is already running")
+    autoRunActive = true
+    try {
+      const stored = await getStoredAutomation(name)
+      if (!stored) throw new Error(`Automation "${name}" not found in extension library. Run: bridge auto sync`)
 
-  let resolveLock!: () => void
-  autoRunLock = new Promise<void>((r) => {
-    resolveLock = r
-  })
-
-  try {
-    await setAutoRun({ status: "running", name, log: [], cancel: false, at: Date.now() })
-    const result = await runRecipeInExtension({
-      recipe: stored.recipe as RecipeLike,
-      input,
-      tab: "active",
-      api: {
-        act: async (actions, tab, withSnapshot) =>
-          runActions(actions as never, tab, withSnapshot !== false, false),
-        eval: (code, arg, timeout, tab) => runEval(code, arg, timeout, tab),
-        snapshot: (tab) => runSnapshot(tab),
-      },
-      isCancelled: async () => {
-        const s = await getAutoRun()
-        return s.cancel === true
-      },
-      onProgress: (p) => {
-        void setAutoRun({
-          status: p.status === "running" ? "running" : p.status,
-          name: p.name,
-          step: p.step,
-          log: p.log.slice(-30),
-          error: p.error,
-          summary: p.summary,
-          at: Date.now(),
-        })
-      },
-    })
-    await setAutoRun({
-      status: result.status,
-      name: result.name,
-      step: result.step,
-      log: result.log.slice(-40),
-      error: result.error,
-      summary: result.summary,
-      at: Date.now(),
-    })
-    void recordJob(`auto:${name}`, result.status === "done", result.summary || result.error || "")
-    return {
-      ok: result.status === "done",
-      status: result.status,
-      summary: result.summary,
-      error: result.error,
+      await setAutoRun({ status: "running", name, log: [], cancel: false, at: Date.now() })
+      const result = await runRecipeInExtension({
+        recipe: stored.recipe as RecipeLike,
+        input,
+        tab: "active",
+        api: {
+          // Already inside the global queue — call run* directly (no nested enqueue).
+          act: async (actions, tab, withSnapshot) =>
+            runActions(actions as never, tab, withSnapshot !== false, false),
+          eval: (code, arg, timeout, tab) => runEval(code, arg, timeout, tab),
+          snapshot: (tab) => runSnapshot(tab),
+        },
+        isCancelled: async () => {
+          const s = await getAutoRun()
+          return s.cancel === true
+        },
+        onProgress: (p) => {
+          void setAutoRun({
+            status: p.status === "running" ? "running" : p.status,
+            name: p.name,
+            step: p.step,
+            log: p.log.slice(-30),
+            error: p.error,
+            summary: p.summary,
+            at: Date.now(),
+          })
+        },
+      })
+      await setAutoRun({
+        status: result.status,
+        name: result.name,
+        step: result.step,
+        log: result.log.slice(-40),
+        error: result.error,
+        summary: result.summary,
+        at: Date.now(),
+      })
+      void recordJob(`auto:${name}`, result.status === "done", result.summary || result.error || "")
+      return {
+        ok: result.status === "done",
+        status: result.status,
+        summary: result.summary,
+        error: result.error,
+      }
+    } finally {
+      autoRunActive = false
     }
-  } finally {
-    resolveLock()
-    autoRunLock = null
-  }
+  })
 }
 
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
@@ -1115,7 +1210,7 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   if (msg?.type !== "job") return
   const job = msg.job as Job
   const detail = jobDetail(job)
-  runJob(job)
+  enqueue(() => runJob(job))
     .then((result) => {
       void recordJob(job.kind, result.ok, result.ok ? detail : (result as { error: string }).error)
       sendResponse(result)

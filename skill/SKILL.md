@@ -23,7 +23,7 @@ description: >-
 # Browser Bridge
 
 A local CLI (`bridge`) drives the user's logged-in Chrome through an MV3
-extension over a WebSocket on `127.0.0.1:8787`. It returns live page content as
+extension over a WebSocket on `127.0.0.1:38471`. It returns live page content as
 **clean Markdown** (plus links and contact info), so you read tidy text instead
 of parsing HTML. It also has LinkedIn-specific scrapers.
 
@@ -41,6 +41,15 @@ bridge ping     # → "✓ Extension connected and responding."
 
 If it hangs on "Waiting for the extension to connect…", the browser side isn't
 ready — see [references/troubleshooting.md](references/troubleshooting.md).
+
+**Hang pattern:** `tabs` / `navigate` work but `snapshot` / `screenshot` hang →
+reload the extension in `chrome://extensions` (do not spam retries).
+
+**Multi-agent (safe by design):** only one `bridge` owns the browser at a time.
+Concurrent agents **queue** on `~/.browser-bridge/bridge.lock` + port `38471`
+(up to ~180s). You will see `Waiting for another bridge command to finish…` —
+that is normal; do not kill the port or open a second browser. Parallel control
+is intentionally unsupported.
 
 ## Commands
 

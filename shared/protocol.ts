@@ -8,7 +8,8 @@
  *   ...result travels back the same chain as JobResult.
  */
 
-export const WS_PORT = 8787
+/** Default local WS port — deliberately uncommon to avoid Cursor MCP / other tools on 8787. */
+export const WS_PORT = 38471
 export const WS_HOST = "127.0.0.1"
 export const WS_URL = `ws://${WS_HOST}:${WS_PORT}`
 

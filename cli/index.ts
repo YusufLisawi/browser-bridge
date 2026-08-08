@@ -352,6 +352,12 @@ function emitPages(results: JobResult[], flags: Flags): void {
 
 const onWaiting = () => process.stderr.write("Waiting for the extension to connect…\n")
 
+/** Default CLI wait for page-scripting jobs (snapshot / screenshot / act).
+ *  Matches extension budgets (~45s script / ~20s capture) with a little slack. */
+const CONTROL_TIMEOUT_MS = 60_000
+
+const controlDispatchOpts = { onWaiting, timeoutMs: CONTROL_TIMEOUT_MS }
+
 /** bridge read <url...> — fetch page(s) as Markdown. With no URL, read the
  *  resolved tab's current page (e.g. `bridge read --tab active`). */
 async function runRead(flags: Flags): Promise<void> {
@@ -510,7 +516,7 @@ async function runAct(actions: ActionStep[], flags: Flags): Promise<void> {
       snapshot: !flags.noSnapshot,
       continueOnError: flags.continueOnError,
     },
-    { onWaiting }
+    { onWaiting, timeoutMs: CONTROL_TIMEOUT_MS }
   )
   emitControl(r, flags)
   process.exit(r.ok && (r.kind !== "act" || r.results.every((s) => s.ok)) ? 0 : 1)
@@ -597,7 +603,10 @@ async function main() {
     process.exit(r.ok ? 0 : 1)
   }
   if (command === "screenshot") {
-    const r = await dispatch({ id: randomUUID(), kind: "screenshot", tab: flags.tab }, { onWaiting })
+    const r = await dispatch(
+      { id: randomUUID(), kind: "screenshot", tab: flags.tab },
+      controlDispatchOpts
+    )
     if (!r.ok || r.kind !== "screenshot") {
       process.stderr.write(`✗ ${r.ok ? "unexpected result" : r.error}\n`)
       process.exit(1)
@@ -609,7 +618,10 @@ async function main() {
     process.exit(0)
   }
   if (command === "snapshot") {
-    const r = await dispatch({ id: randomUUID(), kind: "snapshot", tab: flags.tab }, { onWaiting })
+    const r = await dispatch(
+      { id: randomUUID(), kind: "snapshot", tab: flags.tab },
+      controlDispatchOpts
+    )
     emitControl(r, flags)
     process.exit(r.ok ? 0 : 1)
   }

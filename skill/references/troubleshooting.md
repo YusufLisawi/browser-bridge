@@ -2,6 +2,8 @@
 
 ## Contents
 - Connection problems
+- Snapshot / screenshot hang while tabs / navigate work
+- Multi-agent / concurrent CLI use
 - Empty / wrong results
 - LinkedIn DOM changed (re-tuning selectors)
 - Rebuilding after code changes
@@ -18,8 +20,15 @@
   socket is "connected" only for the brief window a command runs — so the popup
   shows **Bridge ready** (extension alive + listening), not a persistent
   "connected" state. After starting a command it connects within ~1s.
-- Port busy: `lsof -ti:8787 | xargs kill` if a stale `bridge`/server is holding
-  8787 ("Port 8787 is in use — another 'bridge' command may be running.").
+- Port busy: only one `bridge` process can hold `38471` at a time. A second
+  command **waits in line** on `~/.browser-bridge/bridge.lock` (then the port;
+  up to ~180s, override with `BRIDGE_PORT_WAIT_MS`) and prints
+  `Waiting for another bridge command to finish…` (often with the holder pid).
+  If the wait expires: check `cat ~/.browser-bridge/holder.json`, or
+  `lsof -ti:38471 | xargs kill` for a stale holder. Do **not** kill just because
+  another agent is legitimately queued.
+- Advanced: `BRIDGE_WS_PORT` overrides the CLI bind port (extension must be
+  rebuilt with the same `WS_PORT` in `shared/protocol.ts` — they must match).
 - Check the extension popup: **Bridge ready** (green) = the connection layer is
   alive and listening; **Starting** / **Error** = the offscreen document failed
   to boot. The popup also shows a recent-command feed and last-command status —
@@ -27,6 +36,36 @@
   **Starting**, the offscreen script failed (it may use **only**
   `chrome.runtime` messaging, not `chrome.storage`/`chrome.tabs`; state is
   relayed to the service worker which persists it).
+
+## Snapshot / screenshot hang while tabs / navigate work
+
+This pattern means the **page-scripting path** is wedged, not the WebSocket:
+
+- `tabs` / navigate URL change only use `chrome.tabs` → stay fast.
+- `snapshot` / `screenshot` / most `act` / `read` inject JS or capture pixels →
+  hang if the MV3 service worker or tab renderer is stuck.
+
+**Do not spam retries.** Reload the extension in `chrome://extensions` (click ↻
+on Browser Bridge), then `bridge ping` and retry. Timeouts now fail within ~45–60s
+with a reload hint instead of sitting for 180s.
+
+Also check: popup job feed for a stuck last command; only one agent should be
+driving the browser (others wait on the port queue).
+
+## Multi-agent / concurrent CLI use
+
+Browser control is **serialized** (one job at a time) — this is intentional and
+safe for many agents:
+
+1. **CLI lock:** `~/.browser-bridge/bridge.lock` — exclusive; waiters queue fairly.
+   Active holder is recorded in `~/.browser-bridge/holder.json` (pid + command).
+2. **Port bind:** `127.0.0.1:38471` — second layer; wait/retry if needed.
+3. **Extension queue:** background SW runs jobs (and popup automations) through
+   a single-flight mutex so CLI + popup never interleave on the same tab /
+   `data-bb-ref` set / screenshot focus.
+
+Still: one shared browser — agents take turns, they do not run in parallel.
+Port `38471` was chosen to avoid common collisions (e.g. other tools on `8787`).
 
 ## Empty / wrong results
 
@@ -76,18 +115,21 @@ then run. CLI-only changes (`dist-cli`) take effect immediately, no reload.
 
 ## Architecture reference
 
-- **CLI (`cli/`)** — ephemeral WS server per invocation. `dispatch` (one job),
-  `dispatchBatch` (many jobs, one socket, sequential). `ratelimit.ts` enforces
-  LinkedIn caps in `~/.browser-bridge/usage.json`. HTML→Markdown via `turndown`.
+- **CLI (`cli/`)** — ephemeral WS server per invocation on `127.0.0.1:38471`.
+  `dispatch` (one job), `dispatchBatch` (many jobs, one socket, sequential).
+  Concurrent CLIs **queue** via `~/.browser-bridge/bridge.lock` then the port
+  (wait/retry) instead of racing. `ratelimit.ts` enforces LinkedIn caps in
+  `~/.browser-bridge/usage.json`. HTML→Markdown via `turndown`.
 - **Extension (`extension/src/`)**:
-  - `offscreen.ts` — holds the WebSocket, reconnect/backoff. Only uses
-    `chrome.runtime` messaging.
-  - `background.ts` — orchestrator. Owns navigation. Generic `read`/`snapshot`/
-    `act`/`eval` use `chrome.scripting.executeScript` (so they work on any
-    page) + a dedicated background "bridge tab"; LinkedIn uses the content
-    script + the LinkedIn tab. `eval` injects into the MAIN world; `act` adds
-    human-like scroll/mouse motion. Also records a recent-job ring buffer to
-    `chrome.storage` for the popup.
+  - `offscreen.ts` — holds the WebSocket, reconnect/backoff, single-flight job
+    relay with a timeout. Only uses `chrome.runtime` messaging.
+  - `background.ts` — orchestrator. Global job queue serializes CLI + popup
+    work. Owns navigation. Generic `read`/`snapshot`/`act`/`eval` use
+    `chrome.scripting.executeScript` (with hard timeouts) + a dedicated
+    background "bridge tab"; LinkedIn uses the content script + the LinkedIn
+    tab. `eval` injects into the MAIN world; `act` adds human-like scroll/mouse
+    motion. Also records a recent-job ring buffer to `chrome.storage` for the
+    popup.
   - `capture.ts` — MAIN-world hook (console.*, window errors, fetch, XHR) that
     `monitor` registers via `chrome.scripting.registerContentScripts` at
     `document_start`; `logs`/`network` read its `window.__bbCapture` buffer. No
@@ -95,4 +137,4 @@ then run. CLI-only changes (`dist-cli`) take effect immediately, no reload.
   - `content.ts` — stateless scraper executor for LinkedIn commands.
   - `lib/scrape-*.ts` — LinkedIn extractors; `pacing.ts` — human-like delays.
 - **Protocol (`shared/protocol.ts`)** — Job/JobResult types shared by both sides.
-- Manifest `host_permissions` is `http/https <all_urls>` so `read` works anywhere.
+- Manifest `host_permissions` includes `<all_urls>` (+ explicit http/https/file) so `read`/`act`/`eval` work on any normal website. In `chrome://extensions` → Browser Bridge → Site access, set **On all sites**. Chrome still blocks `chrome://`, the Web Store, and similar restricted URLs — no extension can override that.

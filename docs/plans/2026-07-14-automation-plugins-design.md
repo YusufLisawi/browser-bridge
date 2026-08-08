@@ -161,7 +161,7 @@ export function pickDeleteTarget({ arg }) {
 
 ### Session
 
-New CLI helper (conceptual): `withSession(fn)` — bind `127.0.0.1:8787`, wait for extension, keep the socket open, expose `send(job) → JobResult` until the runner finishes. Built by generalizing today’s `dispatchBatch` connection loop (not a separate daemon).
+New CLI helper (conceptual): `withSession(fn)` — bind `127.0.0.1:38471`, wait for extension, keep the socket open, expose `send(job) → JobResult` until the runner finishes. Built by generalizing today’s `dispatchBatch` connection loop (not a separate daemon).
 
 ### Step engine
 

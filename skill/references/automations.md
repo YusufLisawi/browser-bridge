@@ -114,6 +114,6 @@ export function pickDeleteTarget({ arg, vars }) {
 
 - CLI runner: `bridge auto run` (wait/detach). Extension popup: one-click **Run** after `bridge auto sync`.
 - Popup groups by `sites` (or inferred hosts). `call`/hooks.mjs steps are CLI-only.
-- Only one `bridge` command can hold port 8787 at a time; popup runs do not need the CLI.
+- Only one `bridge` command can hold port 38471 at a time; popup runs do not need the CLI.
 - Cancel is cooperative (CLI `cancel` or popup **Stop**).
 - No session recorder in v1 — author recipes after learning the flow manually.
