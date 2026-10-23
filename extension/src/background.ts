@@ -31,9 +31,9 @@ import {
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms))
 
-/** Hint appended to scripting/capture timeouts so agents reload instead of retry-spamming. */
+/** Hint appended to scripting/capture timeouts so agents recover instead of retry-spamming. */
 const RELOAD_HINT =
-  "reload Browser Bridge in chrome://extensions, then retry"
+  "run `bridge recover`, then retry (manual reload is only needed if recovery cannot connect)"
 
 const SCRIPT_TIMEOUT_MS = 45000
 const SCREENSHOT_TIMEOUT_MS = 20000
@@ -101,11 +101,77 @@ function enqueue<T>(fn: () => Promise<T>): Promise<T> {
 
 let creating: Promise<void> | null = null
 
+/**
+ * Detect the offscreen document across Chrome versions. `hasDocument()` was
+ * added much later than the Offscreen API itself; using it unconditionally
+ * makes older-but-supported Chrome versions fail before the WebSocket client
+ * is ever created.
+ */
+async function hasOffscreenDocument(): Promise<boolean> {
+  const offscreenUrl = chrome.runtime.getURL("offscreen.html")
+  const getContexts = (
+    chrome.runtime as typeof chrome.runtime & {
+      getContexts?: (filter: chrome.runtime.ContextFilter) =>
+        Promise<chrome.runtime.ExtensionContext[]>
+    }
+  ).getContexts
+  if (typeof getContexts === "function") {
+    const contexts = await getContexts({
+      contextTypes: ["OFFSCREEN_DOCUMENT" as chrome.runtime.ContextType],
+      documentUrls: [offscreenUrl],
+    })
+    return contexts.length > 0
+  }
+  if (typeof chrome.offscreen.hasDocument === "function") {
+    return chrome.offscreen.hasDocument()
+  }
+
+  // Chrome <116 fallback, matching the official Offscreen API guidance.
+  const swClients = (
+    globalThis as typeof globalThis & {
+      clients?: {
+        matchAll: (options?: { includeUncontrolled?: boolean; type?: string }) =>
+          Promise<Array<{ url?: string }>>
+      }
+    }
+  ).clients
+  if (!swClients) return false
+  const clients = await swClients.matchAll({ includeUncontrolled: true, type: "window" })
+  return clients.some((client) => client.url === offscreenUrl)
+}
+
+/** Check that the offscreen document is alive, not merely present in Chrome. */
+async function offscreenIsHealthy(): Promise<boolean> {
+  try {
+    const result = await withTimeout(
+      chrome.runtime.sendMessage({ type: "offscreen-health" }) as Promise<{ ok?: boolean }>,
+      1500,
+      "offscreen health"
+    )
+    return result?.ok === true
+  } catch {
+    return false
+  }
+}
+
 async function ensureOffscreen(): Promise<void> {
   if (creating) return creating
   creating = (async () => {
     try {
-      if (await chrome.offscreen.hasDocument()) return
+      if (await hasOffscreenDocument()) {
+        if (await offscreenIsHealthy()) {
+          await chrome.storage.local.set({ offscreenError: null })
+          return
+        }
+        // Chrome can retain the document record after its script has died.
+        // Close and recreate it so the alarm can heal the connection without
+        // requiring a visit to chrome://extensions.
+        try {
+          await chrome.offscreen.closeDocument()
+        } catch {
+          /* it may have disappeared between the health check and close */
+        }
+      }
       await chrome.offscreen.createDocument({
         url: "offscreen.html",
         // String literal (not the enum object) in case the runtime enum is absent.
@@ -425,7 +491,48 @@ async function bbExec(payload: any): Promise<any> {
     } catch {}
     return null
   }
-  const setNativeValue = (el: any, value: string) => {
+  const setNativeValue = (initialEl: any, value: string) => {
+    // Accessibility snapshots may expose Facebook's role=textbox wrapper
+    // rather than the nested contenteditable node. Unwrap it before applying
+    // the native rich-text path below.
+    const el =
+      initialEl?.isContentEditable ||
+      initialEl?.getAttribute?.("contenteditable") === "true" ||
+      initialEl?.getAttribute?.("contenteditable") === ""
+        ? initialEl
+        : initialEl?.querySelector?.('[contenteditable="true"], [contenteditable=""]') ?? initialEl
+    // Facebook and other rich-text composers use contenteditable divs rather
+    // than inputs. Calling HTMLInputElement.prototype.value on those nodes
+    // throws "Illegal invocation"; use the browser's native editing command
+    // so the page's editor receives a real input event.
+    if (
+      el?.isContentEditable ||
+      el?.getAttribute?.("contenteditable") === "true" ||
+      el?.getAttribute?.("contenteditable") === ""
+    ) {
+      el.focus?.()
+      const selection = window.getSelection()
+      const range = document.createRange()
+      range.selectNodeContents(el)
+      selection?.removeAllRanges()
+      selection?.addRange(range)
+      let inserted = false
+      try {
+        inserted = document.execCommand("insertText", false, value)
+      } catch {
+        inserted = false
+      }
+      // execCommand already mutates Facebook's Lexical editor and emits the
+      // input event. Dispatching a second synthetic input when it succeeds
+      // makes Lexical apply the same text twice.
+      if (inserted) return
+      el.textContent = value
+      el.dispatchEvent(
+        new InputEvent("input", { bubbles: true, inputType: "insertText", data: value })
+      )
+      el.dispatchEvent(new Event("change", { bubbles: true }))
+      return
+    }
     const proto =
       el.tagName === "TEXTAREA"
         ? HTMLTextAreaElement.prototype
@@ -499,6 +606,104 @@ async function bbExec(payload: any): Promise<any> {
   const a = step.action
   const res: any = { action: a, target: step.target, ok: false }
   try {
+    if (a === "inspect") {
+      const t = resolve(step.target)
+      if (!t) return { ...res, error: "element not found: " + step.target }
+      const attrs: Record<string, string> = {}
+      for (const attr of Array.from(t.attributes || []) as any[]) attrs[attr.name] = attr.value
+      const rect = t.getBoundingClientRect()
+      const chain: any[] = []
+      let n: any = t
+      for (let i = 0; n && i < 6; i += 1, n = n.parentElement) {
+        const r = n.getBoundingClientRect?.()
+        chain.push({
+          tag: n.tagName?.toLowerCase?.(),
+          role: n.getAttribute?.("role"),
+          aria: n.getAttribute?.("aria-label"),
+          text: (n.textContent || "").replace(/\s+/g, " ").trim().slice(0, 160),
+          html: (n.outerHTML || "").slice(0, 1200),
+          rect: r ? { x: r.x, y: r.y, w: r.width, h: r.height } : null,
+          display: getComputedStyle(n).display,
+          visibility: getComputedStyle(n).visibility,
+          opacity: getComputedStyle(n).opacity,
+        })
+      }
+      return {
+        ...res,
+        ok: true,
+        value: {
+          tag: t.tagName?.toLowerCase?.(),
+          role: t.getAttribute?.("role"),
+          text: (t.textContent || "").replace(/\s+/g, " ").trim(),
+          value: t.value ?? null,
+          checked: t.checked ?? null,
+          attrs,
+          rect: { x: rect.x, y: rect.y, w: rect.width, h: rect.height },
+          chain,
+        },
+      }
+    }
+    if (a === "queryAll") {
+      const selector = step.selector ?? step.target
+      if (!selector) return { ...res, error: "queryAll needs selector" }
+      const found = Array.from(document.querySelectorAll(selector)) as any[]
+      const value = found.map((t: any, i: number) => {
+        const r = t.getBoundingClientRect?.()
+        const s = getComputedStyle(t)
+        return {
+          i,
+          tag: t.tagName?.toLowerCase?.(),
+          role: t.getAttribute?.("role"),
+          aria: t.getAttribute?.("aria-label"),
+          text: (t.textContent || "").replace(/\s+/g, " ").trim().slice(0, 300),
+          html: (t.outerHTML || "").slice(0, 1000),
+          checked: t.checked ?? null,
+          rect: r ? { x: r.x, y: r.y, w: r.width, h: r.height } : null,
+          display: s.display,
+          visibility: s.visibility,
+          opacity: s.opacity,
+        }
+      })
+      return { ...res, ok: true, value }
+    }
+    if (a === "fillVisible" || a === "clickVisible" || a === "setCheckedVisible") {
+      const selector = step.selector ?? step.target
+      if (!selector) return { ...res, error: `${a} needs selector` }
+      const matches = Array.from(document.querySelectorAll(selector)).filter(isVisible) as any[]
+      const index = step.index ?? matches.length - 1
+      const t = matches[index]
+      if (!t) return { ...res, error: `no visible match for ${selector}` }
+      if (a === "fillVisible") {
+        setNativeValue(t, step.text ?? step.value ?? "")
+      } else if (a === "setCheckedVisible") {
+        const desired = step.checked !== false
+        const aria = t.getAttribute?.("aria-checked")
+        if (aria !== String(desired)) {
+          // Facebook's switch keeps a stale DOM checked property while its
+          // React state is false. Normalize the property before the native
+          // click so the real control transition is delivered.
+          t.checked = !desired
+          t.click()
+        }
+      } else {
+        t.click()
+      }
+      return { ...res, ok: true, value: { index, count: matches.length } }
+    }
+    if (a === "clickTextVisible") {
+      const selector = step.selector ?? '[role="button"]'
+      const wanted = String(step.text ?? step.value ?? "").trim()
+      const matches = Array.from(document.querySelectorAll(selector)).filter(isVisible).filter((t: any) => {
+        const aria = (t.getAttribute?.("aria-label") || "").trim()
+        const text = (t.textContent || "").replace(/\s+/g, " ").trim()
+        return aria === wanted || text === wanted
+      }) as any[]
+      const index = step.index ?? matches.length - 1
+      const t = matches[index]
+      if (!t) return { ...res, error: `no visible match for text ${wanted}` }
+      t.click()
+      return { ...res, ok: true, value: { index, count: matches.length } }
+    }
     if (a === "waitFor") {
       const start = Date.now()
       const timeout = step.timeout ?? 10000
@@ -545,6 +750,29 @@ async function bbExec(payload: any): Promise<any> {
       if (x == null || y == null) return { ...res, error: "mouseMove needs target or x/y" }
       await humanMoveTo(x, y, step.steps)
       return { ...res, ok: true, value: `${Math.round(x)},${Math.round(y)}` }
+    }
+    if (a === "queryAll") {
+      const selector = step.selector ?? step.target
+      if (!selector) return { ...res, error: "queryAll needs selector" }
+      const found = Array.from(document.querySelectorAll(selector)) as any[]
+      const value = found.map((t: any, i: number) => {
+        const r = t.getBoundingClientRect?.()
+        const s = getComputedStyle(t)
+        return {
+          i,
+          tag: t.tagName?.toLowerCase?.(),
+          role: t.getAttribute?.("role"),
+          aria: t.getAttribute?.("aria-label"),
+          text: (t.textContent || "").replace(/\s+/g, " ").trim().slice(0, 300),
+          html: (t.outerHTML || "").slice(0, 1000),
+          checked: t.checked ?? null,
+          rect: r ? { x: r.x, y: r.y, w: r.width, h: r.height } : null,
+          display: s.display,
+          visibility: s.visibility,
+          opacity: s.opacity,
+        }
+      })
+      return { ...res, ok: true, value }
     }
     const el = resolve(step.target)
     if (!el && a !== "press") return { ...res, error: "element not found: " + step.target }
@@ -685,14 +913,52 @@ async function runEval(
     injectTimeout,
     "eval"
   )
-  const r = (inj?.result ?? { ok: false, error: "no result" }) as {
-    ok: boolean
-    value?: unknown
-    error?: string
+  let r = (inj?.result ?? { ok: false, error: "no result" }) as EvalResult
+  if (!r.ok && /unsafe-eval|Content Security Policy|Trusted Type|EvalError/i.test(r.error ?? "")) {
+    r = (await runInlineEval(tabId, code, arg, timeout, injectTimeout)) ?? r
   }
   if (!r.ok) throw new Error(r.error ?? "eval failed")
   const url = (await chrome.tabs.get(tabId)).url ?? ""
   return { url, value: r.value }
+}
+
+type EvalResult = { ok: boolean; value?: unknown; error?: string }
+
+/**
+ * Strict-CSP pages (GitHub, HN) forbid bbEval's `new Function`. WebKit
+ * (Search, Safari) injects `func` from its source text, outside the page's
+ * CSP, so a function whose toString() is the user's code runs there anyway.
+ * Chrome reads the real source instead and returns no result: null → the
+ * caller keeps the original CSP error.
+ */
+async function runInlineEval(
+  tabId: number,
+  code: string,
+  arg: unknown,
+  timeout: number | undefined,
+  injectTimeout: number
+): Promise<EvalResult | null> {
+  const func = (): null => null
+  func.toString = () => `async (payload) => {
+  const safe = (v) => { try { return JSON.parse(JSON.stringify(v === undefined ? null : v)) } catch { try { return String(v) } catch { return null } } }
+  const ms = payload.timeout ?? 15000
+  try {
+    const run = (async (arg) => {\n${code}\n})(payload.arg)
+    const timer = new Promise((_, rej) => setTimeout(() => rej(new Error("eval timed out after " + ms + "ms")), ms))
+    return { ok: true, value: safe(await Promise.race([run, timer])) }
+  } catch (e) { return { ok: false, error: String((e && e.message) || e) } }
+}`
+  try {
+    const [inj] = await withTimeout(
+      chrome.scripting.executeScript({ target: { tabId }, world: "MAIN", func, args: [{ code, arg, timeout }] as never }),
+      injectTimeout,
+      "eval"
+    )
+    const r = inj?.result as EvalResult | null | undefined
+    return r && typeof r === "object" && "ok" in r ? r : null
+  } catch {
+    return null
+  }
 }
 
 async function resolveTab(target?: string): Promise<number> {
@@ -976,6 +1242,7 @@ async function runCapture(
 
 async function runJob(job: Job): Promise<JobResult> {
   if (job.kind === "ping") return { id: job.id, ok: true, kind: "ping" }
+  if (job.kind === "recover") return { id: job.id, ok: true, kind: "recover" }
   if (job.kind === "read") {
     const page = await runRead(job.url, job.tab)
     return { id: job.id, ok: true, kind: "read", page }
@@ -1089,6 +1356,8 @@ async function recordJob(kind: string, ok: boolean, detail: string): Promise<voi
 /** One-line summary of a job for the history feed. */
 function jobDetail(job: Job): string {
   switch (job.kind) {
+    case "recover":
+      return "restart extension"
     case "read":
       return job.url ?? "(current tab)"
     case "search":
@@ -1181,6 +1450,22 @@ async function startLocalAutomation(name: string, input?: Record<string, unknown
 }
 
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
+  // Recovery must not enter jobChain: a previous executeScript can leave
+  // that chain pending until its timeout, which makes ordinary commands look
+  // like a disconnected extension. Reload from the service worker so its
+  // in-memory queue is guaranteed to be discarded.
+  if (msg?.type === "recover-extension") {
+    sendResponse({ ok: true })
+    setTimeout(() => {
+      try {
+        chrome.runtime.reload()
+      } catch {
+        /* the worker may already be unloading */
+      }
+    }, 50)
+    return true
+  }
+
   // State reports from the offscreen doc (it can't write storage itself).
   if (msg?.type === "ws-state") {
     void chrome.storage.local.set(msg.patch as Record<string, unknown>)
@@ -1209,6 +1494,15 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   }
   if (msg?.type !== "job") return
   const job = msg.job as Job
+
+  // Health checks must remain useful while a page job is wedged. Keep them
+  // outside the browser-work mutex; they do not touch tabs or page state.
+  if (job.kind === "ping") {
+    void recordJob(job.kind, true, "")
+    sendResponse({ id: job.id, ok: true, kind: "ping" })
+    return true
+  }
+
   const detail = jobDetail(job)
   enqueue(() => runJob(job))
     .then((result) => {

@@ -8,8 +8,12 @@
  *   ...result travels back the same chain as JobResult.
  */
 
+/** Baked in by build.mjs from BRIDGE_WS_PORT, so a second browser's extension can dial its own port. */
+declare const __BRIDGE_WS_PORT__: number | undefined
 /** Default local WS port — deliberately uncommon to avoid Cursor MCP / other tools on 8787. */
-export const WS_PORT = 38471
+export const WS_PORT = typeof __BRIDGE_WS_PORT__ === "number" ? __BRIDGE_WS_PORT__ : 38471
+/** Port of the copy built for the Search (WebKit) browser — `npm run build:ext:search`. */
+export const SEARCH_WS_PORT = 38472
 export const WS_HOST = "127.0.0.1"
 export const WS_URL = `ws://${WS_HOST}:${WS_PORT}`
 
@@ -36,6 +40,12 @@ export interface ProfileJob {
 export interface PingJob {
   id: string
   kind: "ping"
+}
+
+/** Control path for recovering a wedged extension without opening chrome://extensions. */
+export interface RecoverJob {
+  id: string
+  kind: "recover"
 }
 
 /** Debug-only: navigate to a search page and return DOM structure hints. */
@@ -213,6 +223,7 @@ export type Job =
   | SearchJob
   | ProfileJob
   | PingJob
+  | RecoverJob
   | ProbeJob
   | ProfileProbeJob
   | ReadJob
@@ -335,6 +346,7 @@ export type JobResult =
   | { id: string; ok: true; kind: "search"; hits: SearchHit[] }
   | { id: string; ok: true; kind: "profile"; profile: ProfileData }
   | { id: string; ok: true; kind: "ping" }
+  | { id: string; ok: true; kind: "recover" }
   | { id: string; ok: true; kind: "probe"; data: unknown }
   | { id: string; ok: true; kind: "read"; page: PageContent }
   | { id: string; ok: true; kind: "snapshot"; url: string; title: string; elements: SnapNode[] }

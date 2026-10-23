@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Browser Bridge",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Drives your logged-in browser from a local CLI over WebSocket: read any page as Markdown, follow links, and scrape sites.",
   "background": {
     "service_worker": "background.js"
@@ -10,8 +10,25 @@
     "default_popup": "popup.html",
     "default_title": "Browser Bridge"
   },
-  "permissions": ["tabs", "scripting", "offscreen", "alarms", "storage", "activeTab"],
-  "host_permissions": ["<all_urls>", "ws://127.0.0.1/*"],
+  "permissions": [
+    "tabs",
+    "scripting",
+    "offscreen",
+    "alarms",
+    "storage",
+    "activeTab",
+    "webNavigation",
+    "unlimitedStorage"
+  ],
+  "host_permissions": [
+    "<all_urls>",
+    "*://*/*",
+    "http://*/*",
+    "https://*/*",
+    "file:///*",
+    "ws://127.0.0.1/*",
+    "wss://127.0.0.1/*"
+  ],
   "content_scripts": [
     {
       "matches": ["https://www.linkedin.com/*", "https://linkedin.com/*"],

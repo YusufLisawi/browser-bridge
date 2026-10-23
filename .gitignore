@@ -1,5 +1,7 @@
 node_modules/
 dist-cli/
 extension/dist/
+extension/dist-search/
+releases/
 *.log
 .DS_Store

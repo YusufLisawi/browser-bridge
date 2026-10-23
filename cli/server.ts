@@ -10,6 +10,7 @@
  * Agents take turns; they never drive the browser in parallel.
  */
 
+import { randomUUID } from "node:crypto"
 import {
   closeSync,
   existsSync,
@@ -43,7 +44,8 @@ function resolveWsPort(): number {
   return n
 }
 
-const BRIDGE_DIR = join(homedir(), ".browser-bridge")
+/** Override only the cross-agent lock location when a sandbox blocks ~/.browser-bridge. */
+const BRIDGE_DIR = process.env.BRIDGE_LOCK_DIR?.trim() || join(homedir(), ".browser-bridge")
 const LOCK_PATH = join(BRIDGE_DIR, "bridge.lock")
 const HOLDER_PATH = join(BRIDGE_DIR, "holder.json")
 const DEFAULT_PORT_WAIT_MS = 180_000
@@ -196,7 +198,16 @@ async function acquireLock(waitMs: number, onWaiting?: () => void): Promise<Lock
       }
     } catch (err) {
       const code = (err as NodeJS.ErrnoException).code
-      if (code !== "EEXIST") throw err
+      if (code !== "EEXIST") {
+        if (code === "EACCES" || code === "EPERM" || code === "ENOENT") {
+          throw new Error(
+            `Cannot access the Browser Bridge lock at ${LOCK_PATH}. ` +
+              `Grant the agent read/write access to ~/.browser-bridge or set ` +
+              `BRIDGE_LOCK_DIR to one shared writable directory for all agents.`
+          )
+        }
+        throw err
+      }
       if (tryRemoveStaleLock(LOCK_PATH)) continue
       const remaining = deadline - Date.now()
       if (remaining <= 0) {
@@ -232,6 +243,38 @@ export interface SessionOptions {
 export interface Session {
   send(job: Job, timeoutMs?: number): Promise<JobResult>
   close(): void
+}
+
+const AUTO_RECOVER_KINDS = new Set<Job["kind"]>([
+  "read",
+  "screenshot",
+  "snapshot",
+  "act",
+  "eval",
+  "monitor",
+  "logs",
+  "network",
+  "search",
+  "profile",
+  "probe",
+  "probeProfile",
+])
+
+function shouldAutoRecover(job: Job, detail: string): boolean {
+  return (
+    job.kind !== "recover" &&
+    AUTO_RECOVER_KINDS.has(job.kind) &&
+    /timed out|no response from extension background|content script not responding/i.test(detail)
+  )
+}
+
+/** Reset a wedged extension without retrying the original (possibly mutating) job. */
+async function recoverSession(session: Session): Promise<void> {
+  try {
+    await session.send({ id: randomUUID(), kind: "recover" }, 10_000)
+  } catch {
+    /* The original socket may already be gone; manual recovery remains the fallback. */
+  }
 }
 
 /**
@@ -355,7 +398,7 @@ export async function createSession(opts: SessionOptions = {}): Promise<Session>
                 new Error(
                   `Timed out after ${timeoutMs}ms on job ${job.id}` +
                     (job.kind === "snapshot" || job.kind === "screenshot" || job.kind === "act"
-                      ? ` — if tabs/navigate still work, reload Browser Bridge in chrome://extensions, then retry`
+                      ? ` — if tabs/navigate still work, run 'bridge recover', then retry`
                       : "")
                 )
               )
@@ -427,7 +470,13 @@ export async function dispatch(job: Job, opts: DispatchOptions = {}): Promise<Jo
     portWaitMs: opts.portWaitMs,
   })
   try {
-    return await session.send(job, opts.timeoutMs ?? 180000)
+    const result = await session.send(job, opts.timeoutMs ?? 180000)
+    if (!result.ok && shouldAutoRecover(job, result.error)) await recoverSession(session)
+    return result
+  } catch (err) {
+    const detail = err instanceof Error ? err.message : String(err)
+    if (shouldAutoRecover(job, detail)) await recoverSession(session)
+    throw err
   } finally {
     session.close()
   }

@@ -10,6 +10,7 @@
 import { randomUUID } from "node:crypto"
 import { readFileSync, writeFileSync } from "node:fs"
 import TurndownService from "turndown"
+import { SEARCH_WS_PORT } from "../shared/protocol.js"
 import type { ActionStep, Job, JobResult, SnapNode, TabTarget } from "../shared/protocol.js"
 import { dispatch, dispatchBatch } from "./server.js"
 import { assertWithinLimit, recordUsage, remainingFor } from "./ratelimit.js"
@@ -99,6 +100,7 @@ function printHelp() {
 
 Usage:
   bridge ping                                  Check the extension is connected
+  bridge recover                               Restart the extension from the agent
   bridge read <url> [<url> ...] [--file f]     Fetch any page(s) as Markdown
   bridge read --tab active                     Read the page you're currently on
   bridge crawl <url> [--limit N] [--same-host] Read a page, follow its links → Markdown
@@ -141,6 +143,7 @@ Usage:
   bridge profiles <url> <url> ... [--file f]   Many profiles in bulk
 
 Options:
+  --search      drive the Search (WebKit) browser instead (its extension listens on port ${SEARCH_WS_PORT})
   --tab active  control: act on your active tab instead of the bridge tab
   --no-snapshot control: skip the after-action snapshot
   --continue-on-error  act: keep running steps after one fails (default: stop)
@@ -485,6 +488,8 @@ function emitControl(r: JobResult, flags: Flags): void {
     log(fmtSnapshot(r.elements))
   } else if (r.kind === "eval") {
     log(typeof r.value === "string" ? r.value : JSON.stringify(r.value, null, 2))
+  } else if (r.kind === "recover") {
+    log("✓ Extension restart requested; retry the Browser Bridge command.")
   } else if (r.kind === "act") {
     for (const s of r.results) {
       const out = s.json !== undefined ? s.json : s.value
@@ -555,7 +560,10 @@ async function runEvalCmd(flags: Flags): Promise<void> {
 }
 
 async function main() {
-  const [command, ...rest] = process.argv.slice(2)
+  // --search anywhere: the Search (WebKit) copy, built with `build:ext:search`, dials its own port.
+  const argv = process.argv.slice(2)
+  if (argv.includes("--search")) process.env.BRIDGE_WS_PORT ??= String(SEARCH_WS_PORT)
+  const [command, ...rest] = argv.filter((a) => a !== "--search")
   const flags = parseFlags(rest)
 
   if (!command || command === "help" || command === "--help" || command === "-h") {
@@ -585,6 +593,14 @@ async function main() {
     if (flags.json) log(JSON.stringify(r, null, 2))
     else if (r.ok && r.kind === "tabs") log(fmtTabs(r.tabs))
     else if (!r.ok) log(`✗ ${r.error}`)
+    process.exit(r.ok ? 0 : 1)
+  }
+  if (command === "recover") {
+    const r = await dispatch(
+      { id: randomUUID(), kind: "recover" },
+      { onWaiting, timeoutMs: 15_000 }
+    )
+    emitControl(r, flags)
     process.exit(r.ok ? 0 : 1)
   }
   if (command === "tab") {

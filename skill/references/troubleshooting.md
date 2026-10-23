@@ -29,6 +29,10 @@
   another agent is legitimately queued.
 - Advanced: `BRIDGE_WS_PORT` overrides the CLI bind port (extension must be
   rebuilt with the same `WS_PORT` in `shared/protocol.ts` — they must match).
+- Sandboxed agents: if the CLI reports `EPERM`/`EACCES` for
+  `~/.browser-bridge/bridge.lock`, grant the agent access to that directory or
+  set `BRIDGE_LOCK_DIR` to one shared writable directory for all agents. This
+  is a terminal filesystem permission, not Chrome site access.
 - Check the extension popup: **Bridge ready** (green) = the connection layer is
   alive and listening; **Starting** / **Error** = the offscreen document failed
   to boot. The popup also shows a recent-command feed and last-command status —
@@ -36,6 +40,19 @@
   **Starting**, the offscreen script failed (it may use **only**
   `chrome.runtime` messaging, not `chrome.storage`/`chrome.tabs`; state is
   relayed to the service worker which persists it).
+
+If a job has timed out and later commands appear stuck behind it, run:
+
+```bash
+bridge recover
+```
+
+This is an extension control command handled outside the normal browser-job
+queue. It asks the offscreen document to call `chrome.runtime.reload()`, then
+the next bridge command reconnects to the fresh worker. Single-job control
+timeouts attempt the same recovery automatically, without retrying the
+original action. A manual reload is still needed once after installing a new
+extension build so Chrome loads the new code.
 
 ## Snapshot / screenshot hang while tabs / navigate work
 
@@ -45,9 +62,9 @@ This pattern means the **page-scripting path** is wedged, not the WebSocket:
 - `snapshot` / `screenshot` / most `act` / `read` inject JS or capture pixels →
   hang if the MV3 service worker or tab renderer is stuck.
 
-**Do not spam retries.** Reload the extension in `chrome://extensions` (click ↻
-on Browser Bridge), then `bridge ping` and retry. Timeouts now fail within ~45–60s
-with a reload hint instead of sitting for 180s.
+**Do not spam retries.** Run `bridge recover`, then `bridge ping` and retry.
+Timeouts now fail within ~45–60s with a recovery hint instead of sitting for
+180s.
 
 Also check: popup job feed for a stuck last command; only one agent should be
 driving the browser (others wait on the port queue).
@@ -122,7 +139,8 @@ then run. CLI-only changes (`dist-cli`) take effect immediately, no reload.
   `~/.browser-bridge/usage.json`. HTML→Markdown via `turndown`.
 - **Extension (`extension/src/`)**:
   - `offscreen.ts` — holds the WebSocket, reconnect/backoff, single-flight job
-    relay with a timeout. Only uses `chrome.runtime` messaging.
+    relay with a timeout, health response, and direct recovery control path.
+    Only uses `chrome.runtime` messaging.
   - `background.ts` — orchestrator. Global job queue serializes CLI + popup
     work. Owns navigation. Generic `read`/`snapshot`/`act`/`eval` use
     `chrome.scripting.executeScript` (with hard timeouts) + a dedicated

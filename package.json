@@ -1,6 +1,6 @@
 {
   "name": "browser-bridge",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "private": true,
   "description": "Local CLI <-> MV3 extension bridge: drive your logged-in browser to read any page as Markdown, follow links, and scrape sites (incl. LinkedIn).",
   "type": "module",
@@ -9,12 +9,14 @@
   },
   "scripts": {
     "build:ext": "node build.mjs",
+    "build:ext:search": "BRIDGE_WS_PORT=38472 node build.mjs --out extension/dist-search",
     "build:cli": "tsc -p tsconfig.cli.json",
     "build": "npm run build:cli && npm run build:ext",
     "watch:ext": "node build.mjs --watch",
     "bridge": "node dist-cli/cli/index.js",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "test": "npm run build:cli && node --test dist-cli/cli/automations/*.test.js"
+    "test": "npm run build:cli && node --test dist-cli/cli/automations/*.test.js",
+    "release:package": "node scripts/package-release.mjs"
   },
   "dependencies": {
     "@types/turndown": "^5.0.6",

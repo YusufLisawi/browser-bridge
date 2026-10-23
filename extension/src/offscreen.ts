@@ -12,6 +12,7 @@ import { WS_URL, type Job, type JobResult } from "../../shared/protocol"
 let socket: WebSocket | null = null
 let attempt = 0
 const MAX_BACKOFF = 8000
+const RECOVER_RELOAD_DELAY_MS = 100
 /** Bound how long we wait for the SW to finish a job (CLI default is longer). */
 const JOB_RELAY_TIMEOUT_MS = 60000
 // The CLI server only exists for the brief window a command runs, so the first
@@ -34,7 +35,7 @@ function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise
       () =>
         reject(
           new Error(
-            `${label} timed out after ${ms}ms — reload Browser Bridge in chrome://extensions, then retry`
+            `${label} timed out after ${ms}ms — run \`bridge recover\`, then retry`
           )
         ),
       ms
@@ -64,6 +65,33 @@ function enqueueRelay<T>(fn: () => Promise<T>): Promise<T> {
   return run
 }
 
+function sendResult(client: WebSocket, result: JobResult): void {
+  try {
+    if (client.readyState === WebSocket.OPEN) client.send(JSON.stringify(result))
+  } catch {
+    /* socket closed mid-job */
+  }
+}
+
+/** A direct control path so recovery is never stuck behind a wedged browser job. */
+function recoverExtension(job: Extract<Job, { kind: "recover" }>, client: WebSocket): void {
+  sendResult(client, { id: job.id, ok: true, kind: "recover" })
+  setTimeout(() => {
+    // Ask the service worker to reload itself. This matters when the worker's
+    // browser-job queue is wedged: reloading only this offscreen page leaves
+    // that in-memory queue alive in some Chromium-based browsers.
+    void chrome.runtime.sendMessage({ type: "recover-extension" }).catch(() => {
+      // Fallback for runtimes that cannot deliver the control message while
+      // the worker is unhealthy; runtime is the only API offscreen exposes.
+      try {
+        chrome.runtime.reload()
+      } catch {
+        /* the extension may already be unloading */
+      }
+    })
+  }, RECOVER_RELOAD_DELAY_MS)
+}
+
 async function relayJob(job: Job): Promise<JobResult> {
   try {
     const result = await withTimeout(
@@ -77,7 +105,7 @@ async function relayJob(job: Job): Promise<JobResult> {
         id: job.id,
         ok: false,
         error:
-          "No response from extension background — reload Browser Bridge in chrome://extensions, then retry",
+          "No response from extension background — run `bridge recover`, then retry",
       }
     }
     return result
@@ -93,44 +121,56 @@ async function relayJob(job: Job): Promise<JobResult> {
 // Breadcrumb: proves this script actually executed.
 report({ offscreenBootedAt: Date.now() })
 
+chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
+  if (msg?.type !== "offscreen-health") return
+  sendResponse({ ok: true, wsConnected: socket?.readyState === WebSocket.OPEN })
+})
+
 const connect = () => {
+  let client: WebSocket
   try {
-    socket = new WebSocket(WS_URL)
+    client = new WebSocket(WS_URL)
   } catch {
     scheduleReconnect()
     return
   }
+  socket = client
 
-  socket.addEventListener("open", () => {
+  client.addEventListener("open", () => {
     attempt = 0
     report({ wsConnected: true, wsLastError: null, wsConnectedAt: Date.now() })
   })
 
-  socket.addEventListener("message", (event) => {
+  client.addEventListener("message", (event) => {
     let job: Job
     try {
       job = JSON.parse(event.data as string)
     } catch {
       return
     }
+    if (job.kind === "recover") {
+      recoverExtension(job, client)
+      return
+    }
     void enqueueRelay(async () => {
       const result = await relayJob(job)
-      try {
-        socket?.send(JSON.stringify(result))
-      } catch {
-        /* socket closed mid-job */
-      }
+      sendResult(client, result)
     })
   })
 
-  socket.addEventListener("close", () => {
+  client.addEventListener("close", () => {
+    if (socket === client) socket = null
     report({ wsConnected: false })
     scheduleReconnect()
   })
 
-  socket.addEventListener("error", () => {
+  client.addEventListener("error", () => {
     report({ wsConnected: false, wsLastError: `connect failed @ ${new Date().toISOString()}` })
-    socket?.close()
+    try {
+      client.close()
+    } catch {
+      /* already closed */
+    }
   })
 }
 

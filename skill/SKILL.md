@@ -43,7 +43,7 @@ If it hangs on "Waiting for the extension to connect…", the browser side isn't
 ready — see [references/troubleshooting.md](references/troubleshooting.md).
 
 **Hang pattern:** `tabs` / `navigate` work but `snapshot` / `screenshot` hang →
-reload the extension in `chrome://extensions` (do not spam retries).
+run `bridge recover` (do not spam retries).
 
 **Multi-agent (safe by design):** only one `bridge` owns the browser at a time.
 Concurrent agents **queue** on `~/.browser-bridge/bridge.lock` + port `38471`
@@ -51,11 +51,23 @@ Concurrent agents **queue** on `~/.browser-bridge/bridge.lock` + port `38471`
 that is normal; do not kill the port or open a second browser. Parallel control
 is intentionally unsupported.
 
+**Search (WebKit browser):** the same extension also runs in the Search browser
+on its own port (38472), next to the Chrome/Arc copy. Add `--search` to any
+command to drive Search instead (`bridge ping --search`, `bridge read <url> --search`).
+After changing extension code: `bun run build:ext:search`, then Reload it in
+Search › Settings › Extensions. WebKit differences:
+- `eval` works even on strict-CSP pages (GitHub, HN, YouTube) — Search injects
+  the code natively; Chrome blocks those.
+- In the hidden bridge tab `innerText` is blank — use `textContent` in eval.
+- Video won't autoplay; click the page's Play button (`act` click by ref).
+- `--tab active` fails on Search's own start page (no extension access there).
+
 ## Commands
 
 | Command | Purpose |
 |---|---|
 | `bridge ping` | Verify the extension is connected |
+| `bridge recover` | Restart a wedged extension from the agent |
 | `bridge read <url> [<url>…] [--file f]` | Fetch any page(s) → Markdown + links + contacts |
 | `bridge crawl <url> [--limit N] [--same-host]` | Read a page, follow its links, Markdown for each |
 | `bridge tabs` · `bridge tab activate\|close\|new <id\|url>` | List / manage open tabs |

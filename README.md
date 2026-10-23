@@ -34,6 +34,16 @@ private and don't run this on an account you can't afford to lose.
 
 ## Setup
 
+**New install?** See [INSTALL.md](INSTALL.md).
+
+When the repo is **public**, one-liner install:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/YusufLisawi/browser-bridge/main/install.sh | bash
+```
+
+Update: `…/install.sh | bash -s -- update` · Manual dev setup below.
+
 ```bash
 cd ~/Developer/browser-bridge
 npm install
@@ -52,6 +62,7 @@ Load the extension:
 
 ```bash
 bridge ping                                  # verify the extension is connected
+bridge recover                               # restart a wedged extension from the agent
 
 # Generic — any site → Markdown
 bridge read "https://example.com/article"
@@ -108,6 +119,34 @@ agents **queue** via `~/.browser-bridge/bridge.lock` — only one drives the
 browser at a time. The extension is the **client** and reconnects automatically,
 so just keep Chrome open — no daemon to run. Generic reads use a dedicated
 background "bridge tab" so they don't disturb your active tab.
+
+If a page-scripting job wedges behind another queued job, run `bridge recover`.
+The command is handled ahead of the normal browser queue and asks the extension
+to call `chrome.runtime.reload()` on itself; it does not need access to
+`chrome://extensions`. Timeouts from single-job control commands attempt this
+recovery automatically once, without retrying the original action.
+
+The CLI lock normally lives at `~/.browser-bridge/bridge.lock`. In a sandbox
+that cannot write the home directory, set `BRIDGE_LOCK_DIR` to the same shared
+writable directory for every agent; this only relocates the lock and holder
+metadata.
+
+## Search (WebKit browser)
+
+The same extension runs in [Search](https://github.com/driceroland/Search) (macOS 15.4+), a WebKit browser that loads Chrome extensions. It gets its own port (38472), so it can stay installed next to the Chrome/Arc copy.
+
+```bash
+npm run build:ext:search        # -> extension/dist-search (dials port 38472)
+```
+
+In Search: Settings › Extensions → load `extension/dist-search` as an unpacked extension. Then add `--search` to any command:
+
+```bash
+bridge ping --search
+bridge read https://example.com --search
+```
+
+Every command was checked against Search: read, crawl, tabs, navigate, snapshot, act, eval, screenshot, scroll, monitor/logs/network, recover.
 
 ## Development
 
